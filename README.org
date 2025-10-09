@@ -63,7 +63,7 @@ Just set =mail-user-agent= to =minimail= and customize the variable
 #+end_src
 
 In addition to the above, you need to configure [[https://www.gnu.org/software/emacs/manual/html_mono/auth.html][auth-source]] to supply
-the passwords.  Some email provides require you to first create an
+the passwords.  Some email providers require you to first create an
 "app password" (for Gmail, see [[https://support.google.com/accounts/answer/185833][this]]).  Then your =~/.authinfo= file
 should look something like this:
 
