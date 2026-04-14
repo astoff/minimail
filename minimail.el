@@ -778,7 +778,6 @@ But first move point inside table if near the end of buffer."
 (defvar-local -imap-command-queue nil)
 (defvar-local -imap-idle-timer nil)
 (defvar-local -imap-last-tag nil)
-(defvar-local -next-position nil) ;TODO: necessary? can't we just rely on point position?
 
 (defun -imap-connect (account)
   "Return a network stream connected to ACCOUNT."
@@ -813,7 +812,7 @@ In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" oth
                 :type stream-type
                 :coding 'binary
                 :nowait t)))
-    (add-function :after (process-filter proc) #'-imap-process-filter)
+    (set-process-filter proc #'-imap-process-filter)
     (set-process-sentinel proc #'-imap-process-sentinel)
     (set-process-query-on-exit-flag proc nil)
     (with-current-buffer buffer
@@ -821,8 +820,7 @@ In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" oth
       (setq -imap-last-tag 0)
       (setq -imap-idle-timer (run-with-timer
                               minimail-connection-idle-timeout nil
-                              #'delete-process proc))
-      (setq -next-position (point-min)))
+                              #'delete-process proc)))
     (-imap-enqueue
      proc nil
      (cond
@@ -850,45 +848,58 @@ In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" oth
          (funcall cb 'error message)))
      (kill-buffer (process-buffer proc)))))
 
-(defun -imap-process-filter (proc _)
-  (timer-set-time -imap-idle-timer
-                  (time-add nil minimail-connection-idle-timeout))
-  (let ((pos -next-position))
-    (when (< pos (point-max))
-      (goto-char pos)
-      (while (re-search-forward "{\\([0-9]+\\)}\r\n" nil t)
-        (let ((pos (+ (point) (string-to-number (match-string 1)))))
-          (setq -next-position pos)
-          (goto-char (min pos (point-max)))))
-      (if (re-search-forward (rx bol
-                                 ?T (group (+ digit))
-                                 ?\s (group (+ alpha))
-                                 ?\s (group (* (not control)))
-                                 (? ?\r) ?\n)
-                             nil t)
-          (pcase-let* ((cont (match-end 0))
-                       (tag (string-to-number (match-string 1)))
-                       (status (intern (downcase (match-string 2))))
-                       (message (match-string 3))
-                       (`(,mailbox . ,callback) (alist-get tag -imap-callbacks)))
-            (setf (alist-get tag -imap-callbacks nil t) nil)
-            (-log-message "response: %s %s\n%s"
-                          proc
-                          (or -current-mailbox "(unselected)")
-                          (buffer-string))
-            (unwind-protect
-                (if (and mailbox (not (equal mailbox -current-mailbox)))
-                    (error "Wrong mailbox: %s expected, %s selected"
-                           mailbox -current-mailbox)
-                  (with-restriction (point-min) cont
-                    (goto-char (point-min))
-                    (funcall callback status message)))
-              (delete-region (point-min) cont)
-              (setq -next-position (point-min))
-              (when-let* ((queued (pop -imap-command-queue)))
-                (apply #'-imap-send proc queued))))
-        (goto-char (point-max))
-        (setq -next-position (pos-bol))))))
+(defun -imap-process-filter (proc string)
+  (with-current-buffer (process-buffer proc)
+    (timer-set-time -imap-idle-timer
+                    (time-add nil minimail-connection-idle-timeout))
+    (save-excursion
+      (goto-char (point-max))
+      (insert string))
+    (cond
+     ;; Case 1: we are in the process of receiving an IMAP literal
+     ;; string.  Keep point at the beginning of the literal string to
+     ;; check again next time if it's complete.  If this test fails,
+     ;; then as a side effect we skip over any complete literal
+     ;; strings that may be present in the buffer.
+     ((catch 'done
+        (while (re-search-forward "{\\([0-9]+\\)}\r\n" nil t)
+          (let ((end (+ (point) (string-to-number (match-string 1)))))
+            (if (<= end (point-max))
+                (goto-char end)
+              (goto-char (match-beginning 0))
+              (throw 'done t))))))
+     ;; Case 2: we find a tagged response.  Call the respective
+     ;; callback and send the next command, if there is one in the
+     ;; queue.
+     ((re-search-forward (rx bol
+                             ?T (group (+ digit))
+                             ?\s (group (+ alpha))
+                             ?\s (group (* (not control)))
+                             (? ?\r) ?\n)
+                         nil t)
+      (pcase-let* ((cont (copy-marker (match-end 0)))
+                   (tag (string-to-number (match-string 1)))
+                   (status (intern (downcase (match-string 2))))
+                   (message (match-string 3))
+                   (`(,mailbox . ,callback) (alist-get tag -imap-callbacks)))
+        (setf (alist-get tag -imap-callbacks nil t) nil)
+        (-log-message "response: %s %s\n%s"
+                      proc
+                      (or -current-mailbox "(unselected)")
+                      (buffer-string))
+        (unwind-protect
+            (progn
+              (cl-assert (equal mailbox (and mailbox -current-mailbox)) t)
+              (with-restriction (point-min) cont
+                (goto-char (point-min))
+                (funcall callback status message)))
+          (delete-region (point-min) cont)
+          (when-let* ((queued (pop -imap-command-queue)))
+            (apply #'-imap-send proc queued)))))
+     ;; Case 3: no tagged response yet.  Look for one again when more
+     ;; data arrives.
+     (t (goto-char (point-max))
+        (goto-char (pos-bol))))))
 
 (defun -imap-send (proc tag mailbox command)
   "Execute an IMAP COMMAND (provided as a string) in network stream PROC.
