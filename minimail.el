@@ -458,6 +458,8 @@ possible, see `minimail--key-match-p'."
                                                  'custom-type))
                                        :value-type)))))))
 
+;;;; Faces
+
 (defgroup minimail-faces nil
   "Faces used by Minimail."
   :group 'minimail
@@ -471,6 +473,11 @@ possible, see `minimail--key-match-p'."
 
 (defface minimail-mode-line-error '((t :inherit error))
   "Face to indicate an error in the mode line.")
+
+(defface minimail-line-drawing '((t :inherit default))
+  "Face used for drawings such as thread trees.")
+
+;;;; Icons
 
 (defgroup minimail-icons nil
   "Icons used by Minimail."
@@ -572,6 +579,35 @@ possible, see `minimail--key-match-p'."
   "Icon for phishing messages."
   :help-echo "Phishing"
   :version "0.3")
+
+(define-icon minimail-thread-leaf-terminal nil
+  '((symbol "└─ " :face minimail-line-drawing)
+    (text "`-- " :face minimail-line-drawing))
+  "Tree-drawing symbol for a leaf which is last among its siblings."
+  :version "0.4")
+
+(define-icon minimail-thread-leaf-nonterminal nil
+  '((symbol "├─ " :face minimail-line-drawing)
+    (text "|-- " :face minimail-line-drawing))
+  "Tree-drawing symbol for leaf which is not last among its siblings."
+  :version "0.4")
+
+(define-icon minimail-thread-parent-terminal nil
+  '((symbol "   " :face minimail-line-drawing)
+    (text "    " :face minimail-line-drawing))
+  "Tree-drawing symbol for a parent which is last among its siblings."
+  :version "0.4")
+
+(define-icon minimail-thread-parent-nonterminal nil
+  '((symbol "│  " :face minimail-line-drawing)
+    (text "|   " :face minimail-line-drawing))
+  "Tree-drawing symbol for a parent which is not last among its siblings."
+  :version "0.4")
+
+(define-icon minimail-thread-false-root nil
+  '((text ""))
+  "Tree-drawing symbol for a thread root that is a reply."
+  :version "0.4")
 
 ;;; Internal variables and helper functions
 
@@ -1893,12 +1929,38 @@ current message."
 
 (defun -format-subject (message)
   "Subject string of MESSAGE formatted for the mailbox buffer."
-  (let-alist message
-    (propertize (concat
-                 (when -sort-by-thread
-                   (make-string (* 2 (length (-thread-ancestors message))) ?\s))
-                 .envelope.subject)
-                'face (-alist-query .flags minimail-subject-faces))))
+  (let* ((ancestors (when -sort-by-thread
+                      (reverse (-thread-ancestors message)))))
+    (concat
+     ;; Indicate an incomplete thread
+     (when (alist-get 'in-reply-to (-message-envelope (car ancestors)))
+       (when (eq (car ancestors) message)
+         (icon-string 'minimail-thread-false-root)))
+     ;; Thread tree prefix
+     (mapconcat
+      (lambda (msg)
+        (icon-string
+         (let ((siblings (-thread-children (-thread-parent msg))))
+           (if (cdr (memq msg siblings)) ;not the last among its siblings
+               (if (eq msg message)
+                   'minimail-thread-leaf-nonterminal
+                 'minimail-thread-parent-nonterminal)
+             (if (eq msg message)
+                 'minimail-thread-leaf-terminal
+               'minimail-thread-parent-terminal)))))
+      (cdr ancestors))
+     ;; The subject itself, possibly mangled
+     (let* ((subject (or (let-alist message .envelope.subject) ""))
+            (boring (let-alist (when -sort-by-thread (-thread-parent message))
+                      (-base-subject .envelope.subject)))
+            (shortened (when (and (not (string-blank-p boring))
+                                  (string-suffix-p boring subject t))
+                         (substring subject 0 (- (length boring)))))
+            (flags (let-alist message .flags)))
+       (propertize (if shortened
+                       (concat shortened (truncate-string-ellipsis))
+                     subject)
+                   'face (-alist-query flags minimail-subject-faces))))))
 
 (defun -format-names (addresses)
   (propertize
@@ -2285,7 +2347,9 @@ style.  If DESCEND is non-nil, use the opposite convention."
       (while-let ((msg (vtable-current-object)))
         (let* ((root (car (last (-thread-ancestors msg))))
                (j (gethash root rootpos))
-               (k (cond ((not j) i) (descend (max i j)) (t (min i j)))))
+               (k (cond ((not j) i)
+                        (descend (max i j))
+                        (t (min i j)))))
           (puthash root k rootpos))
         (push msg messages)
         (cl-incf i)
