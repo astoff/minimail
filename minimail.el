@@ -590,6 +590,8 @@ expected as MAILBOX argument of many functions.
 In IMAP process buffers, this variable holds the name of the selected
 mailbox, or nil when the connection is in unselected state.")
 
+(defvar-local -message-list nil)
+
 (defvar -minibuffer-update-hook nil
   "Hook run when minibuffer completion candidates are updated.")
 
@@ -756,16 +758,28 @@ MAILBOX-NAME in it."
            `(":" (:propertize "Error"
                               help-echo ,(format "%s: %s" error data)
                               face minimail-mode-line-error))))))
-;;;; vtable hacks
+;;;; vtable tricks
 
-(defun -ensure-vtable (&optional noerror)
+(defun -vtable-ensure-table ()
   "Return table under point or signal an error.
 But first move point inside table if near the end of buffer."
-  (when (eobp) (goto-char (pos-bol 0)))
   (or (vtable-current-table)
-      (progn (goto-char (pos-bol 0)) (vtable-current-table))
-      (unless noerror
-        (user-error "No table under point"))))
+      (and (text-property-search-backward 'vtable nil t)
+           (forward-line -1)
+           (vtable-current-table))
+      (user-error "No table found")))
+
+(defun -vtable-find-object (pred &optional below)
+  "Go to the first object satisfying PRED in the current table.
+Return the object, or nil if not found.
+If BELOW is non-nil, only search starting from the current position."
+  (let ((start (point)))
+    (unless below (vtable-beginning-of-table))
+    (while (when-let* ((obj (vtable-current-object)))
+             (not (funcall pred obj)))
+      (forward-line))
+    (or (vtable-current-object)
+        (prog1 nil (goto-char start)))))
 
 (defvar -vtable-before-sort-by-current-column-hook nil)
 (advice-add #'vtable-sort-by-current-column :before
@@ -1434,15 +1448,15 @@ If MAILBOX is displayed in some buffer, update it."
     ;; Possibly update displayed mailbox
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
-        (when-let* ((table (and (equal -current-mailbox mailbox)
-                                (derived-mode-p 'minimail-mailbox-mode)
-                                (vtable-current-table))))
-          (dolist (msg (vtable-objects table))
+        (when (and (equal -current-mailbox mailbox)
+                   (derived-mode-p 'minimail-mailbox-mode))
+          (dolist (msg -message-list)
             (when-let* ((uid (alist-get 'uid msg))
                         (new (seq-find (lambda (it) (eq (alist-get 'uid it) uid))
                                        result)))
               (setf (alist-get 'flags msg) (alist-get 'flags new))
-              (vtable-update-object table msg))))))
+              (ignore-errors
+                (vtable-update-object (-vtable-ensure-table) msg)))))))
     result))
 
 ;;; Commands
@@ -1715,15 +1729,24 @@ This calls `minimail--amove-messages' and takes care of update the UI."
     (when-let* ((-current-mailbox mailbox)
                 (mbxbuf (-find-buffer 'mailbox t)))
       (with-current-buffer mbxbuf
-        (let* ((table (vtable-current-table))
-               (messages (vtable-objects table))
-               (current (when-let* ((msgbuf (-find-buffer 'message t)))
-                          (with-current-buffer msgbuf
-                            (alist-get 'uid -local-state)))))
-          (dolist (msg messages)
-            (when (memq (alist-get 'uid msg) set)
-              (vtable-remove-object table msg)))
-          (when (memq current set)     ;move to next message
+        (let ((messages (seq-remove (lambda (msg)
+                                      (memq (alist-get 'uid msg) set))
+                                    -message-list))
+              (showing (when-let* ((msgbuf (-find-buffer 'message t)))
+                         (get-buffer-window msgbuf)))
+              (next (-vtable-find-object
+                     (lambda (m) (not (memq (alist-get 'uid m) set)))
+                     t)))
+          (-mailbox-buffer-update messages)
+          (unless next
+            ;; Above, we tried to move point to the next message not
+            ;; to be removed.  If not found, then go to the last
+            ;; remaining message.
+            (vtable-end-of-table)
+            (forward-line -1))
+          (when (and showing (not overlay-arrow-position))
+            ;; If we were displaying a message and now it's gone,
+            ;; display message under point.
             (minimail-show-message)))))))
 
 (defun minimail-move-to-mailbox (&optional destination)
@@ -2006,33 +2029,45 @@ Cf. RFC 5256, §2.1."
                                'face 'vtable)))))
 
 (defun -mailbox-buffer-update (messages)
-  "Set vtable objects to MESSAGES and do all necessary adjustments."
-  (setf (vtable-objects (-ensure-vtable)) messages)
-  (let ((uid (alist-get 'uid (vtable-current-object))))
-    (vtable-revert-command)
-    (when-let* ((msg (seq-find (lambda (msg) (let-alist msg (eq .uid uid)))
-                               messages)))
-      (vtable-goto-object msg)))
+  "Set `minimail--message-list' to MESSAGES and do all necessary adjustments."
+  (-vtable-ensure-table)
+  (setq -message-list messages)
   (setq -thread-tree (funcall (pcase-exhaustive
                                   (-settings-scalar-get :thread-style
                                                         -current-mailbox)
                                 ('shallow #'-thread-tree-shallow)
                                 ('hierarchical #'-thread-tree-hierarchical)
                                 ('nil #'ignore))
-                              messages))
-  (when-let* ((how (alist-get 'sort-by-thread -local-state)))
-    (-sort-messages-by-thread (eq how 'descend)))
+                              -message-list))
+  (let ((point-uid (alist-get 'uid (vtable-current-object)))
+        (arrow-uid (when overlay-arrow-position
+                     (save-excursion
+                       (goto-char overlay-arrow-position)
+                       (alist-get 'uid (vtable-current-object))))))
+    (vtable-revert-command)
+    (when-let* ((direction (alist-get 'sort-by-thread -local-state)))
+      ;; FIXME: Can we avoid drawing the table twice?
+      (-sort-messages-by-thread (eq direction 'descend)))
+    (when arrow-uid
+      (save-excursion
+        (if (-vtable-find-object (lambda (m) (eq (alist-get 'uid m)
+                                                 arrow-uid)))
+            (move-marker overlay-arrow-position (point))
+          (setq overlay-arrow-position nil))))
+    (-vtable-find-object (lambda (m) (eq (alist-get 'uid m) point-uid))))
   (save-excursion
-    (goto-char (point-max))
-    (let ((inhibit-read-only t)
-          (ids (mapcar (lambda (msg) (let-alist msg .id)) messages)))
-      (when (get-text-property (1- (pos-eol 0)) 'button)
-        (delete-region (pos-bol 0) (point)))
-      (when (> (seq-min ids) 1)
-        (insert (format "Showing %s of %s messages " (length messages) (seq-max ids))
-                (buttonize "[load more]"
-                           (lambda (_) (minimail-load-more-messages)))
-                "\n")))))
+    (let* ((inhibit-read-only t)
+           (count (length messages))
+           (idmax (seq-max (mapcar (lambda (msg) (let-alist msg .id))
+                                   messages))))
+      (vtable-end-of-table)
+      (delete-region (point) (point-max))
+      (insert (if (eq count idmax)
+                  "Showing all messages"
+                (format "Showing %s of %s messages %s\n" count idmax
+                        (buttonize "[load more]"
+                                   (lambda (_)
+                                     (minimail-load-more-messages)))))))))
 
 (defun -mailbox-buffer-populate (&rest _)
   "Fetch messages for the first time and create a vtable in the current buffer."
@@ -2057,8 +2092,7 @@ Cf. RFC 5256, §2.1."
                 (colnames (-settings-alist-get :mailbox-columns mailbox))
                 (sortnames (-settings-alist-get :mailbox-sort-by mailbox)))
            (make-vtable
-            :objects messages ;Ideally we would create the table empty
-                              ;and populate later
+            :objects-function (lambda () (or -message-list '(((uid . 0)))))
             :columns (mapcar (lambda (v)
                                (alist-get v minimail-mailbox-mode-column-alist))
                              colnames)
@@ -2075,7 +2109,7 @@ Cf. RFC 5256, §2.1."
     (user-error "This should be called only from a mailbox buffer."))
   (let* ((buffer (current-buffer))
          (mailbox -current-mailbox)
-         (messages (vtable-objects (-ensure-vtable)))
+         (messages -message-list)
          (search (alist-get 'search -local-state)))
     (when search (error "Not implemented"))
     (-set-mode-line-suffix 'loading)
@@ -2099,7 +2133,7 @@ many message, otherwise use `minimail-fetch-limit'."
                minimail-mailbox-mode)
   (let* ((buffer (current-buffer))
          (mailbox -current-mailbox)
-         (messages (vtable-objects (-ensure-vtable)))
+         (messages -message-list)
          (search (alist-get 'search -local-state))
          (limit (or count (-settings-scalar-get :fetch-limit mailbox)))
          (before (seq-min (mapcar (lambda (msg) (let-alist msg .uid)) messages))))
@@ -2248,7 +2282,7 @@ preserve the existing order, in the sense that thread A sorts before
 thread B if some message from A comes before all messages of B.  This
 makes sense when the current sort order is in the “most relevant at top”
 style.  If DESCEND is non-nil, use the opposite convention."
-  (let* ((table (-ensure-vtable))
+  (let* ((table (-vtable-ensure-table))
          (mhash (make-hash-table)) ;maps message id -> root id and position within thread
          (rhash (make-hash-table)) ;maps root id -> position across threads
          (lessp (lambda (o1 o2)
@@ -2275,7 +2309,7 @@ style.  If DESCEND is non-nil, use the opposite convention."
         (if descend
             (puthash rootid count rhash)
           (cl-callf (lambda (i) (or i count)) (gethash rootid rhash)))))
-    (setf (vtable-objects table) (sort objects :lessp lessp :in-place t))
+    (setq -message-list (sort objects :lessp lessp :in-place t))
     ;; Little hack to force vtable to redisplay with our new sorting.
     (cl-letf (((vtable-sort-by table) nil))
       (vtable-revert-command))))
@@ -2286,11 +2320,11 @@ style.  If DESCEND is non-nil, use the opposite convention."
   (let* ((old (alist-get 'sort-by-thread -local-state))
          (new (cadr (memq old '(nil ascend descend)))))
     (message "Sorting by thread: %s" (or new "disabled"))
+    (setf (alist-get 'sort-by-thread -local-state) new)
     ;; First re-sort the table by the original criteria, either
     ;; because that's the final goal (new is nil) or in preparation
     ;; for the thread sorting step.
-    (vtable-revert)
-    (setf (alist-get 'sort-by-thread -local-state) new)
+    (vtable-revert-command)
     (when new (-sort-messages-by-thread (eq new 'descend)))))
 
 ;;; Message buffer
