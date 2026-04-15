@@ -1843,8 +1843,8 @@ current message."
 
 ;;; Mailbox buffer
 
-(defvar-local -thread-tree nil
-  "The thread tree for the current buffer, as in RFC 5256.")
+(defvar-local -thread-data nil)
+(defvar-local -sort-by-thread nil)
 
 (defvar-keymap minimail-base-keymap
   :doc "Common keymap for Minimail mailbox and message buffers."
@@ -1878,7 +1878,7 @@ current message."
   ;; Ensure we preserve sorting by column in the following sequence of
   ;; steps: sort by thread, then sort by column, then refresh buffer.
   (add-hook '-vtable-before-sort-by-current-column-hook
-            (lambda () (setf (alist-get 'sort-by-thread -local-state) nil))
+            (lambda () (setq -sort-by-thread nil))
             nil t)
   (setq-local
    buffer-undo-list t
@@ -1886,9 +1886,19 @@ current message."
    truncate-lines t))
 
 (defun -base-subject (string)
-  "Simplify message subject STRING for sorting and threading purposes.
-Cf. RFC 5256, §2.1."
-  (replace-regexp-in-string message-subject-re-regexp "" (downcase string)))
+  "Simplify message subject STRING for sorting and threading purposes."
+  (let ((case-fold-search t))
+    (replace-regexp-in-string message-subject-re-regexp ""
+                              (downcase (or string "")))))
+
+(defun -format-subject (message)
+  "Subject string of MESSAGE formatted for the mailbox buffer."
+  (let-alist message
+    (propertize (concat
+                 (when -sort-by-thread
+                   (make-string (* 2 (length (-thread-ancestors message))) ?\s))
+                 .envelope.subject)
+                'face (-alist-query .flags minimail-subject-faces))))
 
 (defun -format-names (addresses)
   (propertize
@@ -1999,17 +2009,10 @@ Cf. RFC 5256, §2.1."
      :name "Subject"
      :max-width 80
      :getter ,(lambda (msg _tbl)
-                (let-alist msg
-                  (propertize (let ((s (-base-subject (or .envelope.subject ""))))
-                                (if (string-empty-p s) "\0" s))
+                (let ((s (-base-subject (let-alist msg .envelope.subject))))
+                  (propertize (if (string-empty-p s) "\0" s)
                               'minimail msg)))
-     :formatter ,(lambda (s)
-                   (let-alist (-get-data s)
-                     (concat
-                      (when (alist-get 'sort-by-thread -local-state)
-                        (-thread-subject-prefix .uid))
-                      (propertize (or .envelope.subject "")
-                                  'face (-alist-query .flags minimail-subject-faces))))))
+     :formatter ,(lambda (s) (-format-subject (-get-data s))))
     (date
      :name "Date"
      :width 12
@@ -2032,22 +2035,16 @@ Cf. RFC 5256, §2.1."
   "Set `minimail--message-list' to MESSAGES and do all necessary adjustments."
   (-vtable-ensure-table)
   (setq -message-list messages)
-  (setq -thread-tree (funcall (pcase-exhaustive
-                                  (-settings-scalar-get :thread-style
-                                                        -current-mailbox)
-                                ('shallow #'-thread-tree-shallow)
-                                ('hierarchical #'-thread-tree-hierarchical)
-                                ('nil #'ignore))
-                              -message-list))
+  (setq -thread-data nil)
   (let ((point-uid (alist-get 'uid (vtable-current-object)))
         (arrow-uid (when overlay-arrow-position
                      (save-excursion
                        (goto-char overlay-arrow-position)
                        (alist-get 'uid (vtable-current-object))))))
     (vtable-revert-command)
-    (when-let* ((direction (alist-get 'sort-by-thread -local-state)))
+    (when -sort-by-thread
       ;; FIXME: Can we avoid drawing the table twice?
-      (-sort-messages-by-thread (eq direction 'descend)))
+      (-sort-by-thread (eq -sort-by-thread 'descend)))
     (when arrow-uid
       (save-excursion
         (if (-vtable-find-object (lambda (m) (eq (alist-get 'uid m)
@@ -2100,8 +2097,7 @@ Cf. RFC 5256, §2.1."
                                (when-let* ((i (seq-position colnames col)))
                                  `((,i . ,dir))))
                              sortnames))
-           (setf (alist-get 'sort-by-thread -local-state)
-                 (alist-get 'thread sortnames)))
+           (setq -sort-by-thread (alist-get 'thread sortnames)))
          (-mailbox-buffer-update messages))))))
 
 (defun -mailbox-buffer-refresh (&rest _)
@@ -2191,90 +2187,82 @@ If KILL is non-nil, kill the message buffer instead of burying it."
 
 ;;;; Sorting by thread
 
-(defun -thread-position (uid)
-  "Position of UID in the thread tree when regarded as a flat list."
-  (let ((i 0))
-    (named-let recur ((tree -thread-tree))
-      (pcase (car tree)
-        ((pred null))
-        ((pred (eq uid)) i)
-        ((pred numberp) (cl-incf i) (recur (cdr tree)))
-        (subtree (or (recur subtree) (recur (cdr tree))))))))
-
-(defun -thread-root (uid)
-  "The root of the thread to which the given UID belongs."
-  (named-let recur ((root nil) (tree -thread-tree))
-    (pcase (car tree)
-      ((pred null))
-      ((pred (eq uid)) (or root uid))
-      ((and (pred numberp) n) (recur (or root n) (cdr tree)))
-      (subtree (or (recur root subtree) (recur root (cdr tree)))))))
-
-(defun -thread-level (uid)
-  "The nesting level of UID in the thread tree."
-  (named-let recur ((level 0) (tree -thread-tree))
-    (pcase (car tree)
-      ((pred null) nil)
-      ((pred (eq uid)) level)
-      ((pred numberp) (recur (1+ level) (cdr tree)))
-      (subtree (or (recur level subtree) (recur level (cdr tree)))))))
-
-(defun -thread-subject-prefix (uid)
-  "A prefix added to message subjects when sorting by thread."
-  (make-string (* 2 (or (-thread-level uid) 0)) ?\s))
-
-(defun -thread-tree-shallow (messages)
+(defun -thread-data-shallow (messages)
   "Compute a shallow message thread tree from MESSAGES.
-Use server-side thread identifiers if available; otherwise, infer the
-thread structure from the message sujects, as in the ORDEREDSUBJECT
-algorithm described in RFC 5256.  The return value is as described in
-loc. cit. §4, with message UIDs as tree leaves."
-  (let* ((hash (make-hash-table :test #'equal))
-         (threads (progn
-                    (dolist (msg messages)
-                      (let-alist msg
-                        (push msg (gethash (or .thread-id
-                                               (-base-subject
-                                                (or .envelope.subject "")))
-                                           hash))))
-                    (mapcar (lambda (thread)
-                              (sort thread :key #'-message-timestamp :in-place t))
-                            (hash-table-values hash)))))
-    (mapcar (lambda (thread)
-              (cons (let-alist (car thread) .uid)
-                    (mapcar (lambda (v) (let-alist v (list .uid))) (cdr thread))))
-            threads)))
+Use server-side thread identifiers if available, otherwise infer the
+thread structure from the message subjects."
+  (let* ((result (make-hash-table))
+         (threads (make-hash-table :test #'equal)))
+    (dolist (msg messages)
+      (let-alist msg
+        (push msg (gethash (or .thread-id (-base-subject .envelope.subject))
+                           threads))))
+    (dolist (thread (hash-table-values threads))
+      (cl-callf sort thread :key #'-message-timestamp :in-place t)
+      (setf (alist-get 'children (gethash (car thread) result)) (cdr thread))
+      (dolist (child (cdr thread))
+        (setf (alist-get 'parent (gethash child result)) (car thread))))
+    result))
 
-(defun -thread-tree-hierarchical (messages)
+(defun -thread-data-hierarchical (messages)
   "Compute a hierarchical message thread tree from MESSAGES.
 This relies solely on Message-ID and In-Reply-To headers from the IMAP
-envelope and doesn't use server-side threading information.  The return
-value is as described in RFC 5256, §4, with message UIDs as tree leaves."
-  (let* ((msgid (make-hash-table :test #'equal)) ;map Message-ID -> UID
-         (children (make-hash-table))            ;map UID -> list of children messages
-         (roots nil))                            ;list of root messages
+envelope and doesn't use server-side threading information."
+  (let* ((result (make-hash-table))
+         (msgid (make-hash-table :test #'equal))) ;map Message-ID -> msg
     (dolist (msg messages)
       (let-alist msg
         (when .envelope.message-id
-          (puthash .envelope.message-id .uid msgid))))
+          (puthash .envelope.message-id msg msgid))))
     (dolist (msg messages)
-      (if-let* ((inreply (let-alist msg
-                           (and .envelope.in-reply-to
-                                (string-match "<.*?>" .envelope.in-reply-to)
-                                (match-string-no-properties 0 .envelope.in-reply-to))))
-                (parent (gethash inreply msgid)))
-          (push msg (gethash parent children))
-        (push msg roots)))
-    (cl-labels
-        ((recur (msg)
-           (let-alist msg
-             (pcase (gethash .uid children)
-               ('nil (list .uid))
-               (`(,one) (cons .uid (recur one)))
-               (many (cons .uid (mapcar #'recur (sort many :key #'-message-timestamp))))))))
-      (mapcar #'recur roots))))
+      (when-let*
+          ((inreply (let-alist msg
+                      (and .envelope.in-reply-to
+                           (string-match "<.*?>" .envelope.in-reply-to)
+                           (match-string-no-properties 0 .envelope.in-reply-to))))
+           (parent (gethash inreply msgid)))
+        (setf (alist-get 'parent (gethash msg result)) parent)
+        (push msg (alist-get 'children (gethash parent result)))))
+    (dolist (msg messages)
+      (cl-callf sort (alist-get 'children (gethash msg result))
+        :key #'-message-timestamp
+        :in-place t))
+    result))
 
-(defun -sort-messages-by-thread (&optional descend)
+(defun -thread-data ()
+  (with-memoization -thread-data
+    (funcall (pcase-exhaustive
+                 (-settings-scalar-get :thread-style -current-mailbox)
+               ('shallow #'-thread-data-shallow)
+               ('hierarchical #'-thread-data-hierarchical)
+               ('nil (lambda (_) (make-hash-table))))
+             -message-list)))
+
+(defun -thread-parent (message)
+  "The parent of MESSAGE in the thread tree."
+  (alist-get 'parent (gethash message (-thread-data))))
+
+(defun -thread-children (message)
+  "All immediate children of MESSAGE in the thread tree."
+  (alist-get 'children (gethash message (-thread-data))))
+
+(defun -thread-ancestors (message)
+  "All ancestors of MESSAGE, from itself up until the thread root."
+  (with-memoization (alist-get 'ancestors (gethash message (-thread-data)))
+    (let ((parent (-thread-parent message)))
+      (cons message (when parent (-thread-ancestors parent))))))
+
+(defun -thread-flat (message)
+  "The subthread headed by MESSAGE, as a flat list."
+  (with-memoization (alist-get 'flat (gethash message (-thread-data)))
+    (cons message (seq-mapcat #'-thread-flat (-thread-children message)))))
+
+(defun -thread-position (message)
+  "The position of MESSAGE within its thread."
+  (let ((root (car (last (-thread-ancestors message)))))
+    (seq-position (-thread-flat root) message #'eq)))
+
+(defun -sort-by-thread (&optional descend)
   "Sort messages with grouping by threads.
 
 Within a thread, sort each message after its parents.  Across threads,
@@ -2283,33 +2271,26 @@ thread B if some message from A comes before all messages of B.  This
 makes sense when the current sort order is in the “most relevant at top”
 style.  If DESCEND is non-nil, use the opposite convention."
   (let* ((table (-vtable-ensure-table))
-         (mhash (make-hash-table)) ;maps message id -> root id and position within thread
-         (rhash (make-hash-table)) ;maps root id -> position across threads
-         (lessp (lambda (o1 o2)
-                  (pcase-let ((`(,ri . ,pi) (gethash (let-alist o1 .uid) mhash))
-                              (`(,rj . ,pj) (gethash (let-alist o2 .uid) mhash)))
-                    (if (eq ri rj)
-                        (< pi pj)
-                      (< (gethash ri rhash)
-                         (gethash rj rhash))))))
-         objects)
+         (rootpos (make-hash-table))
+         (key (lambda (msg)
+                (let ((root (car (last (-thread-ancestors msg)))))
+                  (cons (gethash root rootpos) (-thread-position msg)))))
+         (i 0)
+         messages)
     (save-excursion
-      ;; Get objects in current sort order (unlike `vtable-objects').
-      (goto-char (vtable-beginning-of-table))
-      (while-let ((obj (vtable-current-object)))
-        (push obj objects)
+      ;; Get messages in current sort order (unlike `vtable-objects')
+      ;; and at the same time fill rootpos with the sorting position
+      ;; of each thread root.
+      (vtable-beginning-of-table)
+      (while-let ((msg (vtable-current-object)))
+        (let* ((root (car (last (-thread-ancestors msg))))
+               (j (gethash root rootpos))
+               (k (cond ((not j) i) (descend (max i j)) (t (min i j)))))
+          (puthash root k rootpos))
+        (push msg messages)
+        (cl-incf i)
         (forward-line)))
-    (cl-callf nreverse objects)
-    (dolist (obj objects)
-      (let* ((count (hash-table-count mhash))
-             (msgid (let-alist obj .uid))
-             (rootid (or (-thread-root msgid) -1))
-             (pos (or (-thread-position msgid) -1)))
-        (puthash msgid (cons rootid pos) mhash)
-        (if descend
-            (puthash rootid count rhash)
-          (cl-callf (lambda (i) (or i count)) (gethash rootid rhash)))))
-    (setq -message-list (sort objects :lessp lessp :in-place t))
+    (setq -message-list (sort messages :key key :in-place t))
     ;; Little hack to force vtable to redisplay with our new sorting.
     (cl-letf (((vtable-sort-by table) nil))
       (vtable-revert-command))))
@@ -2317,15 +2298,14 @@ style.  If DESCEND is non-nil, use the opposite convention."
 (defun minimail-toggle-sort-by-thread ()
   "Toggle sorting messages by thread."
   (interactive nil minimail-mailbox-mode)
-  (let* ((old (alist-get 'sort-by-thread -local-state))
-         (new (cadr (memq old '(nil ascend descend)))))
-    (message "Sorting by thread: %s" (or new "disabled"))
-    (setf (alist-get 'sort-by-thread -local-state) new)
-    ;; First re-sort the table by the original criteria, either
-    ;; because that's the final goal (new is nil) or in preparation
-    ;; for the thread sorting step.
-    (vtable-revert-command)
-    (when new (-sort-messages-by-thread (eq new 'descend)))))
+  (setq -sort-by-thread (cadr (memq -sort-by-thread '(nil ascend descend))))
+  (message "Sorting by thread: %s" (or -sort-by-thread "disabled"))
+  ;; First re-sort the table by the original criteria, either
+  ;; because that's the final goal (new is nil) or in preparation
+  ;; for the thread sorting step.
+  (vtable-revert-command)
+  (when -sort-by-thread
+    (-sort-by-thread (eq -sort-by-thread 'descend))))
 
 ;;; Message buffer
 
