@@ -767,6 +767,12 @@ But first move point inside table if near the end of buffer."
       (unless noerror
         (user-error "No table under point"))))
 
+(defvar -vtable-before-sort-by-current-column-hook nil)
+(advice-add #'vtable-sort-by-current-column :before
+            (lambda (&rest _)
+              (run-hooks '-vtable-before-sort-by-current-column-hook))
+            '((name . -vtable-before-sort-by-current-column-hook)))
+
 ;;; Low-level IMAP communication
 
 ;; References:
@@ -1846,6 +1852,11 @@ current message."
   "Major mode for mailbox listings."
   :interactive nil
   (add-hook 'quit-window-hook #'minimail-quit-message-window nil t)
+  ;; Ensure we preserve sorting by column in the following sequence of
+  ;; steps: sort by thread, then sort by column, then refresh buffer.
+  (add-hook '-vtable-before-sort-by-current-column-hook
+            (lambda () (setf (alist-get 'sort-by-thread -local-state) nil))
+            nil t)
   (setq-local
    buffer-undo-list t
    revert-buffer-function #'-mailbox-buffer-refresh
@@ -2281,14 +2292,6 @@ style.  If DESCEND is non-nil, use the opposite convention."
     (vtable-revert)
     (setf (alist-get 'sort-by-thread -local-state) new)
     (when new (-sort-messages-by-thread (eq new 'descend)))))
-
-;; Ensure we preserve sorting by column in the following sequence of
-;; step: sort by thread, then sort by column, then refresh buffer.
-(advice-add #'vtable-sort-by-current-column :before
-            (lambda (&rest _)
-              (when (derived-mode-p 'minimail-mailbox-mode)
-                (setf (alist-get 'sort-by-thread -local-state) nil)))
-            '((name . minimail)))
 
 ;;; Message buffer
 
