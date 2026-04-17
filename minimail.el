@@ -231,16 +231,25 @@ initialized automatically."
                       ,athunk
                       ,use-lifo-queue))
 
-(cl-defun athunk-run-polling (athunk &key (interval 1) (max-tries -1))
+(cl-defun athunk-run-polling (athunk &key
+                                     (message nil)
+                                     (interval 1)
+                                     (max-tries -1))
   "Run ATHUNK, polling every INTERVAL seconds and blocking until done.
-Give up after MAX-TRIES, if that is non-negative."
-  (let (done err val)
+Give up after MAX-TRIES, if that is non-negative.
+If MESSAGE is non-nil, show a progress reporter, but only if the
+athunk doesn't resolve immediately."
+  (let (done err val reporter)
     (funcall athunk (lambda (e v) (setq done t err e val v)))
     (while (not (or done (zerop max-tries)))
+      (cond
+       (reporter (progress-reporter-update reporter))
+       (message (setq reporter (make-progress-reporter message))))
       (cl-decf max-tries)
       (sleep-for interval))
     (when err (signal err val))
-    (when (not done) (error "athunk timed out"))
+    (unless done (error "athunk timed out"))
+    (when reporter (progress-reporter-done reporter))
     val))
 
 ;;; Customizable options
@@ -728,16 +737,12 @@ cell (ACCOUNT . MAILBOX-NAME).  We then proceed as follows:
    return its value.
 3. Else, return nil."
   (let* ((acct (or (car-safe account-or-mailbox) account-or-mailbox))
-         (mbx (cdr-safe account-or-mailbox))
+         (mbname (cdr-safe account-or-mailbox))
          (found (plist-member (alist-get acct minimail-accounts) keyword))
          (val (cadr found)))
     (cond ((consp (car-safe val)) ;it's a query alist
-           (-alist-query (when mbx
-                           (cons mbx
-                                 ;; Due to caching, will essentially never block.
-                                 (athunk-run-polling
-                                  (-aget-mailbox-flags (cons acct mbx))
-                                  :interval 0.1 :max-tries 10)))
+           (-alist-query (when mbname
+                           (cons mbname (-mailbox-flags (cons acct mbname))))
                          val))
           (found val)
           (t (symbol-value
@@ -758,9 +763,7 @@ alist; if it contains a key matching MAILBOX-NAME, return that value.
 Otherwise, if KEYWORD has an associated fallback variable, look up
 MAILBOX-NAME in it."
   (let* ((acct (car mailbox))
-         (flags (athunk-run-polling ;essentially never blocks, due to caching
-                 (-aget-mailbox-flags mailbox)
-                 :interval 0.1 :max-tries 10))
+         (flags (-mailbox-flags mailbox))
          (keys (cons (cdr mailbox) flags)))
     (if-let* ((alist (plist-get (alist-get acct minimail-accounts) keyword))
               (val (-assoc-query keys alist)))
@@ -1322,10 +1325,15 @@ are 1-based and inclusive of the end."
       (or cached
           (setf (alist-get 'mailboxes (alist-get account -account-state)) new)))))
 
-(defun -aget-mailbox-flags (mailbox)
+(defun -mailbox-flags (mailbox)
   "Return the MAILBOX flags, as a list of strings."
-  (athunk-let* ((mailboxes <- (-aget-mailbox-listing (car mailbox))))
-    (alist-get 'flags (cdr (assoc (cdr mailbox) mailboxes)))))
+  ;; This should actually never block, since if we know the mailbox we
+  ;; must already have fetched the mailbox listing.
+  (athunk-run-polling
+   (athunk-let* ((mailboxes <- (-aget-mailbox-listing (car mailbox))))
+     (alist-get 'flags (assoc (cdr mailbox) mailboxes)))
+   :message "Fetching mailbox information"
+   :interval 0.1 :max-tries 100))
 
 (defun -aget-mailbox-status (mailbox)
   "Get the IMAP status of MAILBOX, as returned by the EXAMINE command."
@@ -1554,11 +1562,11 @@ Return a cons cell consisting of the account symbol and mailbox name."
           (dolist (acct accounts)
             (athunk-run
              (athunk-let*
-                 ((mkcand (pcase-lambda (`(,mbx . ,props))
+                 ((mkcand (pcase-lambda (`(,mbname . ,props))
                             (unless (-key-match-p '(or \\Noselect \\NonExistent)
                                                   (alist-get 'flags props))
-                              (propertize (-mailbox-display-name (cons acct mbx))
-                                          'minimail `(,props ,acct . ,mbx)))))
+                              (propertize (-mailbox-display-name (cons acct mbname))
+                                          'minimail `(,props ,acct . ,mbname)))))
                   (mailboxes <- (athunk-condition-case err
                                     (-aget-mailbox-listing acct)
                                   (t (overlay-put ov 'display " (error):")
@@ -1769,8 +1777,8 @@ This calls `minimail--amove-messages' and takes care of update the UI."
        (_ <- (-amove-messages mailbox destination set)))
     (progress-reporter-done prog)
     (when-let* ((-current-mailbox mailbox)
-                (mbxbuf (-find-buffer 'mailbox t)))
-      (with-current-buffer mbxbuf
+                (buffer (-find-buffer 'mailbox t)))
+      (with-current-buffer buffer
         (let ((messages (seq-remove (lambda (msg)
                                       (memq (-message-uid msg) set))
                                     -message-list))
@@ -1880,6 +1888,7 @@ current message."
                     (-amake-request mailbox command)
                   (:success `(ok ,(with-current-buffer v (buffer-string))))
                   (-imap-error (cdr v)))
+                :message "Contacting IMAP server"
                 :interval 0.1 :max-tries 100)))
     (prog1 status (princ message))))
 
@@ -2744,15 +2753,19 @@ In `minimail-accounts', outgoing-url must have smtps or smtp scheme, got %s" oth
   (pcase-let*
       ((mailbox (or (get-text-property (point) '-current-mailbox)
                     -current-mailbox))
-       (`(,account . ,props) ;some account set up for sending, preferably the current
+       ;; Pick some account set up for sending, preferably the current
+       ;; one.
+       (`(,account . ,props)
         (or (seq-find (lambda (it) (plist-get (cdr it) :outgoing-url))
                       `(,(assq (car mailbox) minimail-accounts)
                         ,@minimail-accounts))
             (user-error "No mail account has been configured to send messages")))
        (drafts (or (plist-get props :drafts-mailbox)
-                   (-find-mailbox-by-flag '\\Drafts (athunk-run-polling
-                                                     (-aget-mailbox-listing account)
-                                                     :interval 0.1 :max-tries 10))))
+                   (-find-mailbox-by-flag '\\Drafts
+                                          (athunk-run-polling
+                                           (-aget-mailbox-listing account)
+                                           :message "Fetching mailbox information"
+                                           :interval 0.1 :max-tries 100))))
        ;; Context for finding settings: the current mailbox if it
        ;; belongs to the account used for sending this email, else
        ;; just the sending account.
