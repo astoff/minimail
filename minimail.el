@@ -636,10 +636,6 @@ mailbox, or nil when the connection is in unselected state.")
 
 (define-error '-imap-error "error in IMAP response")
 
-(defmacro -get-in (alist key &rest rest)
-  (let ((v `(alist-get ,key ,alist nil nil #'equal)))
-    (if rest `(-get-in ,v ,(car rest) ,@(cdr rest)) v)))
-
 (defun -get-data (string)
   "Get data stored as a string property in STRING."
   (cl-assert (stringp string))
@@ -1251,10 +1247,10 @@ server response.  The temporary buffer is cleaned up automatically after
 being used."
   (lambda (cont)
     (let* ((account (or (car-safe account-or-mailbox) account-or-mailbox))
-           (proc (-get-in -account-state account 'process)))
+           (proc (alist-get 'process (alist-get account -account-state))))
       (unless (process-live-p proc)
         (setq proc (-imap-connect account))
-        (setf (-get-in -account-state account 'process) proc))
+        (setf (alist-get 'process (alist-get account -account-state)) proc))
       (-imap-enqueue
        proc (cdr-safe account-or-mailbox) command
        (lambda (status message)
@@ -1274,14 +1270,15 @@ being used."
 
 (defun -aget-capability (account)
   (athunk-let*
-      ((cached (-get-in -account-state account 'capability))
+      ((cached (alist-get 'capability (alist-get account -account-state)))
        (new <- (if cached ;race condition here, but it's innocuous :-)
                    (athunk-wrap nil)
                  (athunk-let*
                      ((buffer <- (-amake-request account "CAPABILITY")))
                    (with-current-buffer buffer
                      (-parse-capability))))))
-    (or cached (setf (-get-in -account-state account 'capability) new))))
+    (or cached
+        (setf (alist-get 'capability (alist-get account -account-state)) new))))
 
 (defun -format-sequence-set (set)
   "Format a set of message IDs as a string.
@@ -1302,7 +1299,8 @@ are 1-based and inclusive of the end."
 (defun -aget-mailbox-listing (account &optional refresh)
   (athunk-with-semaphore (alist-get account -aget-mailbox-listing)
     (athunk-let*
-        ((cached (unless refresh (-get-in -account-state account 'mailboxes)))
+        ((cached (unless refresh
+                   (alist-get 'mailboxes (alist-get account -account-state))))
          (new <- (if cached
                      (athunk-wrap nil)
                    (athunk-let*
@@ -1321,12 +1319,13 @@ are 1-based and inclusive of the end."
                      (with-current-buffer buffer
                        (mapcar (pcase-lambda (`(,k . ,v)) `(,k . ,(mapcan #'cdr v)))
                                (seq-group-by #'car (-parse-list))))))))
-      (or cached (setf (-get-in -account-state account 'mailboxes) new)))))
+      (or cached
+          (setf (alist-get 'mailboxes (alist-get account -account-state)) new)))))
 
 (defun -aget-mailbox-flags (mailbox)
   "Return the MAILBOX flags, as a list of strings."
   (athunk-let* ((mailboxes <- (-aget-mailbox-listing (car mailbox))))
-    (-get-in mailboxes (cdr mailbox) 'flags)))
+    (alist-get 'flags (cdr (assoc (cdr mailbox) mailboxes)))))
 
 (defun -aget-mailbox-status (mailbox)
   "Get the IMAP status of MAILBOX, as returned by the EXAMINE command."
