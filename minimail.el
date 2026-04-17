@@ -740,18 +740,18 @@ cell (ACCOUNT . MAILBOX-NAME).  We then proceed as follows:
          (mbname (cdr-safe account-or-mailbox))
          (found (plist-member (alist-get acct minimail-accounts) keyword))
          (val (cadr found)))
-    (cond ((consp (car-safe val)) ;it's a query alist
-           (-alist-query (when mbname
-                           (cons mbname (-mailbox-flags (cons acct mbname))))
-                         val))
-          (found val)
-          (t (symbol-value
-              (alist-get keyword
-                         '((:fetch-limit . minimail-fetch-limit)
-                           (:full-name . user-full-name)
-                           (:mail-address . user-mail-address)
-                           (:signature . message-signature)
-                           (:thread-style . minimail-thread-style))))))))
+    (when (consp (car-safe val)) ;it's a query alist
+      (let* ((flags (-mailbox-flags (cons acct mbname))))
+        (setq found (-assoc-query (cons mbname flags) val))
+        (setq val (cdr found))))
+    (if found val
+      (symbol-value
+       (alist-get keyword
+                  '((:fetch-limit . minimail-fetch-limit)
+                    (:full-name . user-full-name)
+                    (:mail-address . user-mail-address)
+                    (:signature . message-signature)
+                    (:thread-style . minimail-thread-style)))))))
 
 (defun -settings-alist-get (keyword mailbox)
   "Retrieve the most specific configuration value for KEYWORD.

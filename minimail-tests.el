@@ -100,6 +100,35 @@
       (should (equal (mapcar #'car v)
                      '("INBOX" "INBOX" "[Gmail]" "[Gmail]/All Mail"))))))
 
+;;; Settings logic
+
+(ert-deftest minimail-settings-scalar-get ()
+  (with-temp-buffer
+    (let ((minimail-fetch-limit 1)
+          (minimail-thread-style 'a)
+          (-account-state
+           '((myaccount
+              (mailboxes ("INBOX" (flags))
+                         ("other" (flags))
+                         ("drafty" (flags "\\Drafts"))))))
+          (minimail-accounts
+           '((myaccount :fetch-limit
+                        (("other" . 2)
+                         ("bad" . nil)
+                         ("\\Drafts" . 3))
+                        :thread-style
+                        (("INBOX" . b)
+                         (t . c))))))
+      (should (eq 1 (-settings-scalar-get :fetch-limit '(myaccount . "INBOX"))))
+      (should (eq 1 (-settings-scalar-get :fetch-limit '(myaccount . nil))))
+      (should (eq 2 (-settings-scalar-get :fetch-limit '(myaccount . "other"))))
+      (should (eq 3 (-settings-scalar-get :fetch-limit '(myaccount . "drafty"))))
+      (should (eq nil (-settings-scalar-get :fetch-limit '(myaccount . "bad"))))
+
+      (should (eq 'b (-settings-scalar-get :thread-style '(myaccount . "INBOX"))))
+      (should (eq 'c (-settings-scalar-get :thread-style '(myaccount . "other"))))
+      (should (eq 'c (-settings-scalar-get :thread-style '(myaccount . nil))))
+      (should (eq 'c (-settings-scalar-get :thread-style '(myaccount . "bad")))))))
 
 ;; Local Variables:
 ;; read-symbol-shorthands: (("-" . "minimail--") ("athunk-" . "minimail--athunk-"))
