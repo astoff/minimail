@@ -2568,10 +2568,11 @@ the user selected another message in the meanwhile, yield nil."
    gnus-article-mime-handles nil
    gnus-article-wash-types nil
    gnus-blocked-images ""               ;FIXME: make customizable
+   gnus-header-button-alist nil         ;FIXME: make customizable
+   gnus-button-alist nil                ;FIXME: make customizable
    gnus-newsgroup-charset nil
    gnus-newsgroup-name nil
    gnus-summary-buffer nil
-   message-mail-user-agent t            ;for mouse buttons
    nobreak-char-display nil)
   (run-hooks 'gnus-article-decode-hook)
   (setq gnus-article-decoded-p gnus-article-decode-hook)
