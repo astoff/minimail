@@ -2449,12 +2449,18 @@ the user selected another message in the meanwhile, yield nil."
               (setf (alist-get 'uid -local-state) uid)
               (rename-buffer (-message-buffer-name mailbox uid) t)
               (decode-coding-string text 'raw-text-dos nil buffer)
-              (save-restriction
-                (message-narrow-to-headers-or-head)
-                (setf (alist-get 'references -local-state)
-                      (message-fetch-field "references"))
-                (setf (alist-get 'message-id -local-state)
-                      (message-fetch-field "message-id" t)))
+              (setf (alist-get 'headers -local-state)
+                    (save-restriction
+                      (message-narrow-to-headers-or-head)
+                      (mapcan
+                       (lambda (k)
+                         (when-let* ((v (message-fetch-field (symbol-name k))))
+                           `((,k . ,(mail-decode-encoded-word-string v)))))
+                       '( from to cc subject date message-id references
+                          ;; Funny stuff used to compute the
+                          ;; recipients of a reply:
+                          mail-copies-to mail-followup-to mail-reply-to
+                          original-to reply-to))))
               (funcall render)
               (set-buffer-modified-p nil)
               (when-let* ((window (get-buffer-window (current-buffer))))
@@ -2479,7 +2485,29 @@ the user selected another message in the meanwhile, yield nil."
   (interactive "^P" minimail-message-mode minimail-mailbox-mode)
   (minimail-message-scroll-up arg t))
 
-(defun minimail-reply (cite &optional to-address wide)
+(defun -reply-recipients (headers wide)
+  "Compute recipients of a reply from the original message HEADERS."
+  ;; We really want to reuse the rather complex logic of
+  ;; `message-get-reply-headers' which, sadly, reads headers from the
+  ;; current buffer.  At the same time, we want to honor buffer-local
+  ;; values of variables such as `user-mail-address'.  So use the
+  ;; current buffer (a message buffer) as scratch area.
+  (save-restriction
+    (widen)
+    (goto-char (point-min))
+    (pcase-dolist (`(,key . ,value) headers)
+      (when value
+        (insert (symbol-name key) ": " value ?\n)))
+    (insert ?\n)
+    (let ((end (point-marker)))
+      (prog1
+          (or (funcall (if wide
+                           message-wide-reply-to-function
+                         message-reply-to-function))
+              (message-get-reply-headers wide))
+        (delete-region (point-min) end)))))
+
+(defun minimail-reply (&optional cite wide)
   (interactive (list (xor current-prefix-arg minimail-reply-cite-original))
                minimail-message-mode
                minimail-mailbox-mode)
@@ -2489,36 +2517,37 @@ the user selected another message in the meanwhile, yield nil."
                        (athunk-wrap (current-buffer))
                      (-adisplay-message -current-mailbox
                                         (-message-uid (-current-message))))))
-     (with-current-buffer (or buffer (user-error "No message buffer"))
-       (when-let* ((window (get-buffer-window)))
-         (select-window window))
-       (let ((message-mail-user-agent 'minimail)
-             (message-reply-buffer (current-buffer))
-             (mailbox -current-mailbox)
-             (uid (alist-get 'uid -local-state))
-             (msgid (alist-get 'message-id -local-state))
-             (refs (alist-get 'references -local-state)))
-         (message-reply to-address wide)
-         (when msgid
-           (save-excursion
-             (goto-char (point-min))
-             (insert "In-Reply-To: " msgid ?\n)
-             (insert "References: ")
-             (when refs (insert refs ?\s))
-             (insert msgid ?\n)
-             (narrow-to-region (point) (point-max))))
-         (push (lambda ()
-                 (athunk-run
-                  (-astore-message-flags mailbox uid '\\Answered)))
-               ;;FIXME: Use this or rather `message-sent-hook'?
-               message-send-actions)
-         (when cite (message-yank-original)))))))
+     (set-buffer (or buffer (user-error "No message buffer")))
+     (let ((mailbox -current-mailbox)
+           (uid (alist-get 'uid -local-state))
+           (headers (alist-get 'headers -local-state)))
+       (-compose-mail                   ;this changes current buffer
+        nil nil nil nil nil buffer
+        `((funcall ,(lambda ()
+                        (athunk-run
+                         (-astore-message-flags mailbox uid '\\Answered))))))
+       (pcase-dolist (`(,key . ,value) (-reply-recipients headers wide))
+         (message-replace-header (symbol-name key) value))
+       (let-alist headers
+         (message-replace-header
+          "Subject" (concat "Re: " (message-simplify-subject .subject)))
+         (message-replace-header
+          "In-Reply-To" .message-id)
+         (message-replace-header
+          "References" (concat .references (when .references " ") .message-id)))
+       (message-sort-headers)
+       (message-hide-headers)
+       (setq buffer-undo-list nil)
+       (message-goto-body)
+       (when cite
+         (with-undo-amalgamate
+           (message-yank-original)))))))
 
-(defun minimail-reply-all (cite &optional to-address)
+(defun minimail-reply-all (cite)
   (interactive (list (xor current-prefix-arg minimail-reply-cite-original))
                minimail-message-mode
                minimail-mailbox-mode)
-  (minimail-reply cite to-address t))
+  (minimail-reply cite t))
 
 (defun minimail-forward ()
   (interactive nil minimail-message-mode minimail-mailbox-mode)
@@ -2528,17 +2557,17 @@ the user selected another message in the meanwhile, yield nil."
                        (athunk-wrap (current-buffer))
                      (-adisplay-message -current-mailbox
                                         (-message-uid (-current-message))))))
-     (with-current-buffer (or buffer (user-error "No message buffer"))
-       (when-let* ((window (get-buffer-window)))
-         (select-window window))
-       (let ((message-mail-user-agent 'minimail)
-             (mailbox -current-mailbox)
-             (uid (alist-get 'uid -local-state)))
-         (message-forward)
-         (push (lambda ()
-                 (athunk-run
-                  (-astore-message-flags mailbox uid '$Forwarded)))
-               message-send-actions))))))
+     (set-buffer (or buffer (user-error "No message buffer")))
+     (let* ((mailbox -current-mailbox)
+            (uid (alist-get 'uid -local-state))
+            (message-forward-decoded-p t)
+            (subject (message-make-forward-subject)))
+       (-compose-mail                   ;this changes current buffer
+        nil subject nil nil nil nil
+        `((funcall ,(lambda ()
+                        (athunk-run
+                         (-astore-message-flags mailbox uid '$Forwarded))))))
+       (message-forward-make-body buffer)))))
 
 ;;;; Gnus graft
 ;; Cf. `mu4e--view-render-buffer' from mu4e-view.el
@@ -2720,37 +2749,38 @@ Unless REFRESH is non-nil, use cached mailbox information."
 
 ;;;###autoload
 (define-mail-user-agent 'minimail
-  #'minimail-message-mail
+  #'-compose-mail
   #'message-send-and-exit
   #'message-kill-buffer
   'message-send-hook)
 
-(defun -send-mail-via-smtpmail ()
+(defun -send-mail ()
   "Call `smtpmail-send-it' with parameters from the X-Minimail-Account header."
-  (let ((account (save-restriction
-                   (message-narrow-to-headers-or-head)
-                   (mail-fetch-field "X-Minimail-Account"
-                                     nil nil nil t))))
-    (let* ((props (or (alist-get (intern-soft account) minimail-accounts)
-                      (user-error "Invalid Minimail account: %s" account)))
-           (url (url-generic-parse-url (plist-get props :outgoing-url)))
-           (smtpmail-store-queue-variables t)
-           (smtpmail-smtp-server (url-host url))
-           (smtpmail-smtp-user (cond ((url-user url) (url-unhex-string (url-user url)))
-                                     ((plist-get props :mail-address))))
-           (smtpmail-stream-type (pcase (url-type url)
-                                   ("smtps" 'tls)
-                                   ("smtp" 'starttls)
-                                   (other (user-error "\
-In `minimail-accounts', outgoing-url must have smtps or smtp scheme, got %s" other))))
-           (smtpmail-smtp-service (or (url-portspec url)
-                                      (pcase smtpmail-stream-type
-                                        ('tls 465)
-                                        ('starttls 587)))))
-      (smtpmail-send-it))))
+  (let* ((account (save-restriction
+                    (message-narrow-to-headers-or-head)
+                    (mail-fetch-field "X-Minimail-Account" nil nil nil t)))
+         (props (or (cdr (assoc account minimail-accounts #'string=))
+                    (user-error "Invalid Minimail account: %s" account)))
+         (url (url-generic-parse-url (plist-get props :outgoing-url)))
+         (smtpmail-store-queue-variables t)
+         (smtpmail-smtp-server (url-host url))
+         (smtpmail-smtp-user (cond ((url-user url)
+                                    (url-unhex-string (url-user url)))
+                                   ((plist-get props :mail-address))))
+         (smtpmail-stream-type (pcase (url-type url)
+                                 ("smtps" 'tls)
+                                 ("smtp" 'starttls)
+                                 (other (user-error "\
+In `minimail-accounts', outgoing-url must have smtps or smtp scheme, \
+got %s" other))))
+         (smtpmail-smtp-service (or (url-portspec url)
+                                    (pcase smtpmail-stream-type
+                                      ('tls 465)
+                                      ('starttls 587)))))
+    (smtpmail-send-it)))
 
 ;;;###autoload
-(defun minimail-message-mail (&optional to subject &rest rest)
+(defun -compose-mail (&optional to subject &rest rest)
   (pcase-let*
       ((mailbox (or (get-text-property (point) '-current-mailbox)
                     -current-mailbox))
@@ -2777,22 +2807,23 @@ In `minimail-accounts', outgoing-url must have smtps or smtp scheme, got %s" oth
         (pcase (-settings-scalar-get :signature ctx)
           (`(file ,fname . nil) (cons t fname))
           (v (cons v message-signature-file))))
-       (setup (lambda ()
-                (setq-local -current-mailbox (cons account drafts)
-                            user-full-name name
-                            user-mail-address addr
-                            message-signature sig
-                            message-signature-file sigfile))))
-    (let ((message-mail-user-agent 'message-user-agent)
-          (message-mode-hook (cons setup message-mode-hook)))
-      (apply #'message-mail to subject rest))
-    (setq-local message-send-mail-function #'-send-mail-via-smtpmail)
-    (message-add-header (format "X-Minimail-Account: %s" account))
+       (setup (make-symbol "minimail--setup")))
+    (fset setup
+          (lambda ()
+            (setq-local -current-mailbox (cons account drafts)
+                        user-full-name name
+                        user-mail-address addr
+                        message-send-mail-function #'-send-mail
+                        message-signature sig
+                        message-signature-file sigfile)))
+    (let ((message-mail-user-agent nil))
+      (add-hook 'message-mode-hook setup -90)
+      (unwind-protect
+          (apply #'message-mail to subject rest)
+        (remove-hook 'message-mode-hook setup)))
+    (message-replace-header "X-Minimail-Account" (symbol-name account))
     (message-sort-headers)
-    (cond
-     ((not to) (message-goto-to))
-     ((not subject) (message-goto-subject))
-     (t (message-goto-body)))
+    (message-position-point)
     t))
 
 ;;; Completion framework integration
