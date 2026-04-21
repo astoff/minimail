@@ -259,7 +259,7 @@ athunk doesn't resolve immediately."
   :prefix "minimail-"
   :group 'mail)
 
-(cl-defun -custom-type-query-alist (&key key-type value-type allow-single)
+(cl-defun -custom-type-query-alist (&key key-type value-type allow-single value)
   (let* ((kt (pcase-exhaustive key-type
                ('mailbox '(choice
                            (const :tag "Default" t)
@@ -286,10 +286,12 @@ athunk doesn't resolve immediately."
                         (sexp :tag "Complex selector")))))
          (alist `(alist :key-type ,kt :value-type ,value-type)))
     (if allow-single
-        `(choice
-          ,(pcase-let ((`(,v . ,rest) (ensure-list value-type)))
-             `(,v :tag "Account-global value" . ,rest))
-          (alist :tag "Mailbox-specific values" . ,(cdr alist)))
+        `(choice :tag "Scope"
+                 :value ,value
+                 ,value-type
+                 (alist :tag "Mailbox-specific values"
+                        :match ,(lambda (_ v) (consp v))
+                        ,@(cdr alist)))
       alist)))
 
 (defcustom minimail-reply-cite-original t
@@ -373,10 +375,6 @@ This is used in `minimail-mailbox-mode' buffers."
 This is an alist where keys are names used to refer to each account and
 values are a plist with the following information:
 
-:mail-address
-  The email address of this account.  Overrides the global value of
-  `user-mail-address'.
-
 :incoming-url
   Information about the IMAP server as a URL. Normally, it suffices to
   enter \"imaps://<server-address>\".  More generally, it can take the
@@ -393,6 +391,9 @@ values are a plist with the following information:
   Information about the SMTP server as a URL.  Normally, it suffices
   to enter \"smtps://<server-address>\", but you can provide more
   details as in :incoming-url.
+:mail-address
+  The email address of this account.  Overrides the global value of
+  `user-mail-address'.
 
 :full-name
   Name used in the To field of messages you compose.  Overrides the
@@ -430,10 +431,14 @@ possible, see `minimail--key-match-p'."
     (plist
      :tag "Account properties"
      :options
-     ((:mail-address string)
-      (:incoming-url string)
+     ((:incoming-url string)
       (:outgoing-url string)
-      (:full-name string)
+      (:mail-address    ,(-custom-type-query-alist
+                          :allow-single t :value ""
+                          :key-type 'mailbox :value-type 'string))
+      (:full-name       ,(-custom-type-query-alist
+                          :allow-single t :value ""
+                          :key-type 'mailbox :value-type 'string))
       (:signature       ,(-custom-type-query-alist
                           :allow-single t
                           :key-type 'mailbox
@@ -443,15 +448,14 @@ possible, see `minimail--key-match-p'."
                                         (string :tag "String to insert")
                                         (function :tag "Function to call")
                                         (list :tag "Use signature file"
-                                              (const file) file))))
+                                              (const :format "" file) file))))
       (:thread-style    ,(-custom-type-query-alist
                           :allow-single t
                           :key-type 'mailbox
                           :value-type (get 'minimail-thread-style 'custom-type)))
       (:fetch-limit     ,(-custom-type-query-alist
-                          :allow-single t
-                          :key-type 'mailbox
-                          :value-type 'natnum))
+                          :allow-single t :value 100
+                          :key-type 'mailbox :value-type 'natnum))
       (:mailbox-columns ,(-custom-type-query-alist
                           :allow-single t
                           :key-type 'mailbox
@@ -741,15 +745,18 @@ cell (ACCOUNT . MAILBOX-NAME).  We then proceed as follows:
          (found (plist-member (alist-get acct minimail-accounts) keyword))
          (val (cadr found)))
     (when (consp (car-safe val)) ;it's a query alist
-      (let* ((flags (-mailbox-flags (cons acct mbname))))
-        (setq found (-assoc-query (cons mbname flags) val))
+      (let ((key (when mbname
+                   (cons mbname (-mailbox-flags (cons acct mbname))))))
+        (setq found (-assoc-query key val))
         (setq val (cdr found))))
     (if found val
       (symbol-value
        (alist-get keyword
                   '((:fetch-limit . minimail-fetch-limit)
                     (:full-name . user-full-name)
-                    (:mail-address . user-mail-address)
+                    ;; Unlike other keywords, we care to distinguish
+                    ;; when this one is explicitly set
+                    ;; (:mail-address . user-mail-address)
                     (:signature . message-signature)
                     (:thread-style . minimail-thread-style)))))))
 
@@ -844,8 +851,10 @@ If BELOW is non-nil, only search starting from the current position."
                         ("imap" 'starttls)
                         (other (user-error "\
 In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" other))))
-         (user (cond ((url-user url) (url-unhex-string (url-user url)))
-                     ((plist-get props :mail-address))))
+         (user (or (when (url-user url)
+                      (url-unhex-string (url-user url)))
+                   (-settings-scalar-get :mail-address account)
+                   (user-error "No username found for account %s" account)))
          (pass (or (url-password url)
                    (let ((enable-recursive-minibuffers t))
                      (auth-source-pick-first-password
