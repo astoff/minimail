@@ -46,28 +46,36 @@ to try it out.
 ** Configuration
 
 Just set =mail-user-agent= to =minimail= and customize the variable
-=minimail-accounts=.  Here is an illustrative example:
+=minimail-accounts=.  The latter accepts many different options, so it
+might be convenient to explore it using the Customize interface (even
+if you later decide to simply copy the Lisp expression to your init
+file).  That said, the only required option is =:incoming-url=.  In
+order to send emails, you should also set the =:mail-address= option
+as well as the =message-server-alist= variable from the [[https://www.gnu.org/software/emacs/manual/html_node/message][Message]]
+package.
+
+Here is an illustrative example:
 
 #+begin_src emacs-lisp
 (setq mail-user-agent 'minimail
       minimail-accounts
       '((gmail ;; This can be any symbol you like to identify the account
          :mail-address "somebody@gmail.com"
-         :incoming-url "imaps://imap.gmail.com"
-         :outgoing-url "smtps://smtp.gmail.com")
+         :incoming-url "imaps://imap.gmail.com")
         (work ;; Assuming Evil Corp. uses "Google Workspace" as email provider
          :mail-address "webmaster@evilcorp.com"
          :incoming-url "imaps://imap.gmail.com"
-         :outgoing-url "smtps://smtp.gmail.com"
          :signature (file "~/work/.signature"))
         (uni
          :mail-address "somebody@math.niceuni.edu"
-         ;; Include a username in the server URLs if it doesn't match
-         ;; your email address.
-         ;; Use `imap' and `smtp' as URL scheme if your server only
-         ;; supports STARTTLS.
-         :incoming-url "imap://username@imap.niceuni.edu"
-         :outgoing-url "smtp://username@smtp.niceuni.edu")))
+         ;; Include a username in the IMAP server URL if it doesn't
+         ;; match your email address.  Use `imap' as URL scheme if the
+         ;; server only supports STARTTLS.
+         :incoming-url "imap://username@imap.niceuni.edu"))
+      message-server-alist
+      '(("somebody@gmail.com" . "smtp smtp.gmail.com 465 somebody@gmail.com")
+        ("webmaster@evilcorp.com" . "smtp smtp.gmail.com 465 webmaster@evilcorp.com")
+        ("somebody@math.niceuni.edu" . "smtp smtp.niceuni.edu 587 username")))
 #+end_src
 
 In addition to the above, you need to configure [[https://www.gnu.org/software/emacs/manual/html_mono/auth.html][auth-source]] to supply
@@ -85,6 +93,10 @@ machine smtp.gmail.com login webmaster@evilcorp.com password yyyyyyyyyyyyyyyy
 machine imap.niceuni.edu login username password zzzzzzzzzzzzzzzz
 machine smtp.niceuni.edu login username password zzzzzzzzzzzzzzzz
 #+end_src
+
+Once you get the basics up and running, try
+=M-x customize-group minimail RET= to explore all customization
+options.
 
 ** Usage
 

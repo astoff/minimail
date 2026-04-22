@@ -37,7 +37,6 @@
 
 (require 'gnus-art)
 (require 'peg)      ;need peg.el from Emacs 30, which is ahead of ELPA
-(require 'smtpmail)
 (require 'transient)
 (require 'tree-widget)
 (require 'vtable)
@@ -387,10 +386,6 @@ values are a plist with the following information:
   If password is omitted (which is highly recommended), use the
   auth-source mechanism. See Info node `(auth) Top' for details.
 
-:outgoing-url
-  Information about the SMTP server as a URL.  Normally, it suffices
-  to enter \"smtps://<server-address>\", but you can provide more
-  details as in :incoming-url.
 :mail-address
   The email address of this account.  Overrides the global value of
   `user-mail-address'.
@@ -432,7 +427,6 @@ possible, see `minimail--key-match-p'."
      :tag "Account properties"
      :options
      ((:incoming-url string)
-      (:outgoing-url string)
       (:mail-address    ,(-custom-type-query-alist
                           :allow-single t :value ""
                           :key-type 'mailbox :value-type 'string))
@@ -2763,76 +2757,55 @@ Unless REFRESH is non-nil, use cached mailbox information."
   #'message-kill-buffer
   'message-send-hook)
 
-(defun -send-mail ()
-  "Call `smtpmail-send-it' with parameters from the X-Minimail-Account header."
-  (let* ((account (save-restriction
-                    (message-narrow-to-headers-or-head)
-                    (mail-fetch-field "X-Minimail-Account" nil nil nil t)))
-         (props (or (cdr (assoc account minimail-accounts #'string=))
-                    (user-error "Invalid Minimail account: %s" account)))
-         (url (url-generic-parse-url (plist-get props :outgoing-url)))
-         (smtpmail-store-queue-variables t)
-         (smtpmail-smtp-server (url-host url))
-         (smtpmail-smtp-user (cond ((url-user url)
-                                    (url-unhex-string (url-user url)))
-                                   ((plist-get props :mail-address))))
-         (smtpmail-stream-type (pcase (url-type url)
-                                 ("smtps" 'tls)
-                                 ("smtp" 'starttls)
-                                 (other (user-error "\
-In `minimail-accounts', outgoing-url must have smtps or smtp scheme, \
-got %s" other))))
-         (smtpmail-smtp-service (or (url-portspec url)
-                                    (pcase smtpmail-stream-type
-                                      ('tls 465)
-                                      ('starttls 587)))))
-    (smtpmail-send-it)))
-
 ;;;###autoload
-(defun -compose-mail (&optional to subject &rest rest)
-  (pcase-let*
-      ((mailbox (or (get-text-property (point) '-current-mailbox)
-                    -current-mailbox))
-       ;; Pick some account set up for sending, preferably the current
-       ;; one.
-       (`(,account . ,props)
-        (or (seq-find (lambda (it) (plist-get (cdr it) :outgoing-url))
-                      `(,(assq (car mailbox) minimail-accounts)
-                        ,@minimail-accounts))
-            (user-error "No mail account has been configured to send messages")))
-       (drafts (or (plist-get props :drafts-mailbox)
-                   (-find-mailbox-by-flag '\\Drafts
-                                          (athunk-run-polling
-                                           (-aget-mailbox-listing account)
-                                           :message "Fetching mailbox information"
-                                           :interval 0.1 :max-tries 100))))
-       ;; Context for finding settings: the current mailbox if it
-       ;; belongs to the account used for sending this email, else
-       ;; just the sending account.
-       (ctx (if (eq (car mailbox) account) mailbox account))
-       (name (-settings-scalar-get :full-name ctx))
-       (addr (-settings-scalar-get :mail-address ctx))
-       (`(,sig . ,sigfile)
-        (pcase (-settings-scalar-get :signature ctx)
-          (`(file ,fname . nil) (cons t fname))
-          (v (cons v message-signature-file))))
-       (setup (make-symbol "minimail--setup")))
-    (fset setup
-          (lambda ()
-            (setq-local -current-mailbox (cons account drafts)
-                        user-full-name name
-                        user-mail-address addr
-                        message-send-mail-function #'-send-mail
-                        message-signature sig
-                        message-signature-file sigfile)))
+(defun -compose-mail (&rest args)
+  (let* ((mailbox (or (get-text-property (point) '-current-mailbox)
+                      -current-mailbox))
+         (address (or (-settings-scalar-get :mail-address mailbox)
+                      ;; Don't read `user-mail-address' directly as it may be
+                      ;; some generated nonsense.
+                      (message-user-mail-address)
+                      (completing-read
+                       "Send mail as: "
+                       (mapcan
+                        (lambda (it)
+                          (let ((addr (plist-get (cdr it) :mail-address)))
+                            (if (stringp addr)
+                                (list addr)
+                              (mapcar #'cdr addr))))
+                        minimail-accounts))))
+         (hook (lambda ()
+                 (setq-local
+                  -current-mailbox mailbox
+                  user-mail-address address
+                  user-full-name (-settings-scalar-get :full-name mailbox))
+                 (pcase (-settings-scalar-get :signature mailbox)
+                   (`(file ,fname . nil)
+                    (setq-local message-signature t
+                                message-signature-file fname))
+                   (v (setq-local message-signature v))))))
     (let ((message-mail-user-agent nil))
-      (add-hook 'message-mode-hook setup -90)
+      (add-hook 'message-mode-hook hook -90)
       (unwind-protect
-          (apply #'message-mail to subject rest)
-        (remove-hook 'message-mode-hook setup)))
-    (message-replace-header "X-Minimail-Account" (symbol-name account))
+          (apply #'message-mail args)
+        (remove-hook 'message-mode-hook hook)))
     (message-sort-headers)
     (message-position-point)
+    (unless (seq-some (pcase-lambda (`(,cond . ,_))
+                        (or (functionp cond)
+                            (and (stringp cond)
+                                 (string-equal-ignore-case
+                                  cond user-mail-address))))
+                      message-server-alist)
+      (save-excursion
+        (lwarn 'minimail :warning "\
+No entry of `message-server-alist' matches the
+address %S.
+%s this variable to be able to send messages."
+               user-mail-address
+               (buttonize "Customize"
+                          #'customize-variable
+                          'message-server-alist))))
     t))
 
 ;;; Completion framework integration
