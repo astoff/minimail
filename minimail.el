@@ -1410,7 +1410,7 @@ messages with UID smaller than BEFORE."
   (athunk-let*
       ((end <- (if before
                    (-afetch-id mailbox before)
-                 (athunk-let ((status <- (-aget-mailbox-status mailbox)))
+                 (athunk-let* ((status <- (-aget-mailbox-status mailbox)))
                    (1+ (alist-get 'exists status)))))
        (start (max 1 (- end limit)))
        (messages <- (if (> end 1)
@@ -1912,6 +1912,9 @@ current message."
   "J" #'minimail-move-to-junk
   "D" #'minimail-move-to-trash
   "M" #'minimail-move-to-mailbox
+  "t" #'minimail-toggle-message-flags
+  "!" #'minimail-toggle-message-flagged
+  "." #'minimail-toggle-message-seen
   "SPC" #'minimail-message-scroll-up
   "S-SPC" #'minimail-message-scroll-down
   "DEL" #'minimail-message-scroll-down)
@@ -2258,6 +2261,67 @@ If KILL is non-nil, kill the message buffer instead of burying it."
   (when-let* ((msgbuf (-find-buffer 'message t))
               (window (get-buffer-window msgbuf)))
     (quit-restore-window window (if kill 'kill 'bury))))
+
+(defun -flag-readable-name (flag)
+  (let ((v (if (symbolp flag) (symbol-name flag) flag)))
+    (propertize (if (string-match-p (rx bos (or ?\\ ?$)) v)
+                    (substring v 1) v)
+                'minimail flag)))
+
+(defun minimail-toggle-message-flags (set flags &optional how)
+  "Toggle FLAGS of a message SET in the current mailbox.
+HOW can be positive to add, negative to remove, or nil to toggle each of
+the flags.  When SET has more than one message, toggling means to add a
+flag if at least one message is missing it, and remove it otherwise.
+
+Interactively, SET is given by the selected messages or the message
+under point, FLAGS is read from the minibuffer and HOW comes from the
+prefix argument."
+  (interactive (let* ((how (prefix-numeric-value (or current-prefix-arg 0)))
+                      ;; TODO: use flags from EXAMINE
+                      (flags (mapcar #'-flag-readable-name
+                                     '(\\Seen \\Flagged \\Answered
+                                       $Forwarded $Junk $Phishing)))
+                      (query (mapcar
+                              (lambda (it) (or (car (member it flags)) it))
+                              (completing-read-multiple
+                               (format "%s flags: " (cond ((cl-plusp how) "Add")
+                                                          ((cl-minusp how) "Remove")
+                                                          (t "Toggle")))
+                               flags nil t))))
+                 (list (-selected-messages)
+                       (seq-uniq (delq nil (mapcar #'-get-data query)))
+                       how))
+               minimail-mailbox-mode minimail-message-mode)
+  (dolist (flag (ensure-list flags))
+    (let* ((flagp (lambda (uid)
+                    (let ((msg (seq-find (lambda (m) (eq (-message-uid m) uid))
+                                         -message-list)))
+                      (assoc-string flag (-message-flags msg)))))
+           (remove
+            (cond ((cl-plusp how) nil)
+                  ((cl-minusp how) t)
+                  (t (seq-every-p flagp (ensure-list set))))))
+      (athunk-run
+       (-astore-message-flags -current-mailbox set flag remove)))))
+
+(defun minimail-toggle-message-seen (set &optional how)
+  "Toggle the Seen flag of the current message(s).
+The meaning of SET and HOW, as well as the interactive behavior, are as
+in `minimail-toggle-message-flags'."
+  (interactive (list (-selected-messages)
+                     (prefix-numeric-value (or current-prefix-arg 0)))
+               minimail-mailbox-mode minimail-message-mode)
+  (minimail-toggle-message-flags set '\\Seen how))
+
+(defun minimail-toggle-message-flagged (set &optional how)
+  "Toggle the Flagged flag of the current message(s).
+The meaning of SET and HOW, as well as the interactive behavior, are as
+in `minimail-toggle-message-flags'."
+  (interactive (list (-selected-messages)
+                     (prefix-numeric-value (or current-prefix-arg 0)))
+               minimail-mailbox-mode minimail-message-mode)
+  (minimail-toggle-message-flags set '\\Flagged how))
 
 ;;;; Sorting by thread
 
