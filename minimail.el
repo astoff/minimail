@@ -721,6 +721,13 @@ Return the first matching cons cell."
 Return the first matching value."
   (if-let* ((it (-assoc-query key alist))) (cdr it) default))
 
+(defun -mailbox-flags (mailbox)
+  "Return the flags of MAILBOX, as a list of strings."
+  ;; This could potentially block but shouldn't, since if we know the
+  ;; mailbox we must already have fetched the mailbox listing.
+  (alist-get 'flags (assoc (cdr mailbox)
+                           (-get-mailbox-listing (car mailbox)))))
+
 (defun -settings-scalar-get (keyword account-or-mailbox)
   "Retrieve the most specific configuration value for KEYWORD.
 
@@ -1328,14 +1335,12 @@ are 1-based and inclusive of the end."
       (or cached
           (setf (alist-get 'mailboxes (alist-get account -account-state)) new)))))
 
-(defun -mailbox-flags (mailbox)
-  "Return the MAILBOX flags, as a list of strings."
-  ;; This should actually never block, since if we know the mailbox we
-  ;; must already have fetched the mailbox listing.
+(defun -get-mailbox-listing (account)
+  "Blocking version of `minimail--aget-mailbox-listing'.
+To be used where we know the information is already cached."
   (athunk-run-polling
-   (athunk-let* ((mailboxes <- (-aget-mailbox-listing (car mailbox))))
-     (alist-get 'flags (assoc (cdr mailbox) mailboxes)))
-   :message "Fetching mailbox information"
+   (-aget-mailbox-listing account)
+   :message "Fetching mailboxes"
    :interval 0.1 :max-tries 100))
 
 (defun -aget-mailbox-status (mailbox)
@@ -1469,21 +1474,6 @@ Return a list of up to LIMIT message metadata alists, as in
        (messages <- (-afetch-message-info mailbox (last set limit))))
     messages))
 
-(defun -amove-messages (mailbox destination set)
-  "Move message SET from MAILBOX to DESTINATION.
-DESTINATION is just a string and refers to a mailbox in the same account
-as the original MAILBOX."
-  (athunk-let*
-      ((caps <- (-aget-capability (car mailbox)))
-       (cmd (if (memq 'move caps)
-                (format "UID MOVE %s %s"
-                        (-format-sequence-set set)
-                        (-imap-quote destination))
-              (error "Account %s doesn't support moving messages"
-                     (car mailbox))))
-       (_ <- (-amake-request mailbox cmd)))
-    t))
-
 (defun -astore-message-flags (mailbox set flags &optional remove)
   "Add FLAGS to each message in the MAILBOX message SET.
 If REMOVE is non-nil, remove those flags instead.
@@ -1511,6 +1501,47 @@ If MAILBOX is displayed in some buffer, update it."
               (ignore-errors
                 (vtable-update-object (-vtable-ensure-table) msg)))))))
     result))
+
+(defun -acopy-messages (mailbox set destination)
+  "Copy message SET from MAILBOX to DESTINATION."
+  (-amake-request mailbox (format "UID COPY %s %s"
+                                  (-format-sequence-set set)
+                                  (-imap-quote destination))))
+
+(defun -amove-messages-and-redisplay ( mailbox set destination
+                                       &optional mailbox-buffer)
+  "Move message SET from MAILBOX to DESTINATION.
+If MAILBOX-BUFFER is non-nil, updating the UI when done."
+  (athunk-let*
+      ((caps <- (-aget-capability (car mailbox)))
+       (cmd (if (memq 'move caps)
+                (format "UID MOVE %s %s"
+                        (-format-sequence-set set)
+                        (-imap-quote destination))
+              (error "Account %s doesn't support moving messages"
+                     (car mailbox))))
+       (_ <- (-amake-request mailbox cmd)))
+    (when (buffer-live-p mailbox-buffer)
+      (with-current-buffer mailbox-buffer
+        (let ((messages (seq-remove (lambda (msg)
+                                      (memq (-message-uid msg) set))
+                                    -message-list))
+              (showing (when-let* ((msgbuf (-find-buffer 'message t)))
+                         (get-buffer-window msgbuf)))
+              (next (-vtable-find-object
+                     (lambda (m) (not (memq (-message-uid m) set)))
+                     t)))
+          (-mailbox-buffer-update messages)
+          (unless next
+            ;; Above, we tried to move point to the next message not
+            ;; to be removed.  If not found, then go to the last
+            ;; remaining message.
+            (vtable-end-of-table)
+            (forward-line -1))
+          (when (and showing (not overlay-arrow-position))
+            ;; If we were displaying a message and now it's gone,
+            ;; display message under point.
+            (minimail-show-message)))))))
 
 ;;; Commands
 
@@ -1768,63 +1799,52 @@ it may contain non-ASCII characters."
       (-mailbox-buffer-populate)
       buffer)))
 
-;;;; Moving
+;;;; Copying and moving
 
-(defun -amove-messages-and-redisplay (mailbox destination set)
-  "Move message SET from MAILBOX to DESTINATION.
-This calls `minimail--amove-messages' and takes care of update the UI."
-  (athunk-let*
-      ((destname (-mailbox-display-name (cons (car mailbox) destination)))
-       (prog (make-progress-reporter
-              (format-message "Moving messages to `%s'..." destname)))
-       (_ <- (-amove-messages mailbox destination set)))
-    (progress-reporter-done prog)
-    (when-let* ((-current-mailbox mailbox)
-                (buffer (-find-buffer 'mailbox t)))
-      (with-current-buffer buffer
-        (let ((messages (seq-remove (lambda (msg)
-                                      (memq (-message-uid msg) set))
-                                    -message-list))
-              (showing (when-let* ((msgbuf (-find-buffer 'message t)))
-                         (get-buffer-window msgbuf)))
-              (next (-vtable-find-object
-                     (lambda (m) (not (memq (-message-uid m) set)))
-                     t)))
-          (-mailbox-buffer-update messages)
-          (unless next
-            ;; Above, we tried to move point to the next message not
-            ;; to be removed.  If not found, then go to the last
-            ;; remaining message.
-            (vtable-end-of-table)
-            (forward-line -1))
-          (when (and showing (not overlay-arrow-position))
-            ;; If we were displaying a message and now it's gone,
-            ;; display message under point.
-            (minimail-show-message)))))))
-
-(defun minimail-move-to-mailbox (&optional destination)
-  "Move messages to a given DESTINATION mailbox.
+(defun minimail-copy-to-mailbox (&optional destination)
+  "Copy messages to a given DESTINATION mailbox.
+Interactively, or if DESTINATION is nil, ask for one.
 In a mailbox buffer, act on the message under point or, if the region is
 active, all messages in the region.  In a message buffer, act on the
 current message."
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (let* ((mailbox -current-mailbox)
-         (uids (-selected-messages))
-         (prompt (if (length= uids 1)
-                     "Move message to: "
-                   (format "Move %s messages to: " (length uids))))
-         (dest (or destination
-                   (cdr (-read-mailbox prompt (car mailbox))))))
+  (let* ((set (-selected-messages)))
     (athunk-run
-     (-amove-messages-and-redisplay mailbox dest uids))))
+     (-acopy-messages -current-mailbox set
+                      (or destination
+                          (cdr (-read-mailbox
+                                (if (length= set 1) "Copy message to: "
+                                  (format "Copy %s messages to: "
+                                          (length set)))
+                                (car -current-mailbox))))))))
 
-(defun -find-mailbox-by-flag (flag mailboxes)
+(defun minimail-move-to-mailbox (&optional destination)
+  "Move messages to a given DESTINATION mailbox.
+Interactively, or if DESTINATION is nil, ask for one.
+In a mailbox buffer, act on the message under point or, if the region is
+active, all messages in the region.  In a message buffer, act on the
+current message."
+  (interactive nil minimail-mailbox-mode minimail-message-mode)
+  (let* ((set (-selected-messages)))
+    (athunk-run
+     (-amove-messages-and-redisplay
+      -current-mailbox set
+      (or destination
+          (cdr (-read-mailbox
+                (if (length= set 1) "Move message to: "
+                  (format "Move %s messages to: "
+                          (length set)))
+                (car -current-mailbox))))
+      (-find-buffer 'mailbox t)))))
+
+(defun -find-mailbox-by-flag (account flag)
   "Return the first item of MAILBOXES which has the given FLAG.
 FLAG can be a string or, more generally, a condition for
 `minimail--key-match-p'."
   (seq-some (pcase-lambda (`(,mailbox . ,items))
-              (when (-key-match-p flag (alist-get 'flags items)) mailbox))
-            mailboxes))
+              (when (-key-match-p flag (alist-get 'flags items))
+                mailbox))
+            (-get-mailbox-listing account)))
 
 (defun minimail-move-to-archive ()
   "Move messages to the archive mailbox.
@@ -1832,17 +1852,10 @@ In a mailbox buffer, act on the message under point or, if the region is
 active, all messages in the region.  In a message buffer, act on the
 current message."
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (let ((mailbox -current-mailbox)
-        (uids (-selected-messages)))
-    (athunk-run
-     (athunk-let*
-         ((mailboxes <- (-aget-mailbox-listing (car mailbox)))
-          (dest (or (plist-get (alist-get (car mailbox) minimail-accounts)
-                               :archive-mailbox)
-                    (-find-mailbox-by-flag '\\Archive mailboxes)
-                    (-find-mailbox-by-flag '\\All mailboxes)
-                    (user-error "Archive mailbox not found")))
-          (_ <- (-amove-messages-and-redisplay mailbox dest uids)))))))
+  (minimail-move-to-mailbox
+   (or (-settings-scalar-get :archive-mailbox -current-mailbox)
+       (-find-mailbox-by-flag (car -current-mailbox) '(or \\Archive \\All))
+       (user-error "Archive mailbox not found"))))
 
 (defun minimail-move-to-trash ()
   "Move messages to the trash mailbox.
@@ -1850,16 +1863,10 @@ In a mailbox buffer, act on the message under point or, if the region is
 active, all messages in the region.  In a message buffer, act on the
 current message."
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (let ((mailbox -current-mailbox)
-        (uids (-selected-messages)))
-    (athunk-run
-     (athunk-let*
-         ((mailboxes <- (-aget-mailbox-listing (car mailbox)))
-          (dest (or (plist-get (alist-get (car mailbox) minimail-accounts)
-                               :trash-mailbox)
-                    (-find-mailbox-by-flag '\\Trash mailboxes)
-                    (user-error "Trash mailbox not found")))
-          (_ <- (-amove-messages-and-redisplay mailbox dest uids)))))))
+  (minimail-move-to-mailbox
+   (or (-settings-scalar-get :trash-mailbox -current-mailbox)
+       (-find-mailbox-by-flag (car -current-mailbox) '\\Trash)
+       (user-error "Trash mailbox not found"))))
 
 (defun minimail-move-to-junk ()
   "Move messages to the junk mailbox.
@@ -1867,16 +1874,10 @@ In a mailbox buffer, act on the message under point or, if the region is
 active, all messages in the region.  In a message buffer, act on the
 current message."
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (let ((mailbox -current-mailbox)
-        (uids (-selected-messages)))
-    (athunk-run
-     (athunk-let*
-         ((mailboxes <- (-aget-mailbox-listing (car mailbox)))
-          (dest (or (plist-get (alist-get (car mailbox) minimail-accounts)
-                               :junk-mailbox)
-                    (-find-mailbox-by-flag '\\Junk mailboxes)
-                    (user-error "Junk mailbox not found")))
-          (_ <- (-amove-messages-and-redisplay mailbox dest uids)))))))
+  (minimail-move-to-mailbox
+   (or (-settings-scalar-get :junk-mailbox -current-mailbox)
+       (-find-mailbox-by-flag (car -current-mailbox) '\\Junk)
+       (user-error "Junk mailbox not found"))))
 
 (defun minimail-execute-server-command (mailbox command)
   "Execute an IMAP COMMAND in MAILBOX for debugging purposes."
@@ -1902,22 +1903,23 @@ current message."
 
 (defvar-keymap minimail-base-keymap
   :doc "Common keymap for Minimail mailbox and message buffers."
+  "SPC" #'minimail-message-scroll-up
+  "DEL" #'minimail-message-scroll-down
+  "S-SPC" #'minimail-message-scroll-down
   "n" #'minimail-next-message
   "p" #'minimail-previous-message
   "r" #'minimail-reply
   "R" #'minimail-reply-all
   "f" #'minimail-forward
   "s" #'minimail-search
+  "C" #'minimail-copy-to-mailbox
   "A" #'minimail-move-to-archive
-  "J" #'minimail-move-to-junk
   "D" #'minimail-move-to-trash
+  "J" #'minimail-move-to-junk
   "M" #'minimail-move-to-mailbox
   "t" #'minimail-toggle-message-flags
   "!" #'minimail-toggle-message-flagged
-  "." #'minimail-toggle-message-seen
-  "SPC" #'minimail-message-scroll-up
-  "S-SPC" #'minimail-message-scroll-down
-  "DEL" #'minimail-message-scroll-down)
+  "." #'minimail-toggle-message-seen)
 
 (defvar-keymap minimail-mailbox-mode-map
   :parent (make-composed-keymap (list minimail-base-keymap vtable-map)
