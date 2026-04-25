@@ -1493,13 +1493,14 @@ If MAILBOX is displayed in some buffer, update it."
       (with-current-buffer buffer
         (when (and (equal -current-mailbox mailbox)
                    (derived-mode-p 'minimail-mailbox-mode))
-          (dolist (msg -message-list)
-            (when-let* ((uid (-message-uid msg))
-                        (new (seq-find (lambda (it) (eq (-message-uid it) uid))
-                                       result)))
-              (setf (cdr (assq 'flags msg)) (-message-flags new))
-              (ignore-errors
-                (vtable-update-object (-vtable-ensure-table) msg)))))))
+          (save-window-excursion      ;because of vtable-update-object
+            (dolist (msg -message-list)
+              (when-let* ((uid (-message-uid msg))
+                          (new (seq-find (lambda (it) (eq (-message-uid it) uid))
+                                         result)))
+                (setf (cdr (assq 'flags msg)) (-message-flags new))
+                (ignore-errors
+                  (vtable-update-object (-vtable-ensure-table) msg))))))))
     result))
 
 (defun -acopy-messages (mailbox set destination)
@@ -1919,16 +1920,89 @@ current message."
   "M" #'minimail-move-to-mailbox
   "t" #'minimail-toggle-message-flags
   "!" #'minimail-toggle-message-flagged
-  "." #'minimail-toggle-message-seen)
+  "." #'minimail-toggle-message-seen
+  "c" #'compose-mail)
 
 (defvar-keymap minimail-mailbox-mode-map
   :parent (make-composed-keymap (list minimail-base-keymap vtable-map)
                                 special-mode-map)
   "RET" #'minimail-show-message
+  "<double-mouse-1>" #'minimail-show-message
+  "<double-down-mouse-1>" #'ignore
   "+" #'minimail-load-more-messages
   "=" #'minimail-quit-message-window
-  "T" #'minimail-toggle-sort-by-thread
+  "T" #'minimail-sort-by-thread
   "g" #'revert-buffer)
+
+(easy-menu-define nil minimail-mailbox-mode-map
+  "Menu for `minimail-mailbox-mode'."
+  `("Mailbox"
+    ["Fetch New Messages" revert-buffer
+     :help "Check the server for new messages"]
+    ["Fetch More Old Messages" minimail-load-more-messages
+     :active (length< -message-list (-mailbox-total-messages))
+     :help "Add older messages to the current mailbox buffer"]
+    ("Sort by Thread"
+     ["Off" (minimail-sort-by-thread nil)
+      :style radio :selected (not -sort-by-thread)
+      :help "Do not group message by thread"]
+     ["Ascending" (minimail-sort-by-thread 'ascend)
+      :style radio :selected (eq -sort-by-thread 'ascend)
+      :help "Most relevant threads towards the top of the buffer"]
+     ["Descending" (minimail-sort-by-thread 'descend)
+      :style radio :selected (eq -sort-by-thread 'descend)
+      :help "Most relevant threads towards the bottom of the buffer"])
+    ["Search Messages" minimail-search
+     :help "Search for messages in this mailbox"]
+    ["Compose New Message" compose-mail
+     :help "Start writing a new mail message"]))
+
+(defun -message-context-menu (menu &optional click)
+  "Context menu for messages.
+MENU and CLICK are as expected of a member of `context-menu-functions'."
+  (when-let* ((set (save-excursion
+                     (unless (use-region-p)
+                       ;; Act either on the message at point or on all
+                       ;; messages encompassed by region.
+                       (mouse-set-point click))
+                     (ignore-errors (-selected-messages)))))
+    (let* ((mailbox -current-mailbox)
+           (msg (seq-find (lambda (m) (eq (-message-uid m) (car set)))
+                          -message-list))
+           (flags (-message-flags msg))
+           (flagitems (lambda (items)
+                        (mapcar
+                         (lambda (flag)
+                           (let ((selected (assoc-string flag flags)))
+                             `[,(-flag-readable-name flag)
+                               (minimail-toggle-message-flags
+                                ',set ',flag ,(if selected -1 +1))
+                               :style toggle :selected ,selected]))
+                         items)))
+           (callback (lambda (action dest)
+                       (athunk-run
+                        (pcase action
+                          ('copy (-acopy-messages mailbox set dest))
+                          ('move (-amove-messages-and-redisplay
+                                  mailbox set dest
+                                  (-find-buffer 'mailbox t)))))))
+           (mbitems (pcase-lambda (`(,action))
+                      (mapcan
+                       (pcase-lambda (`(,name . ,props))
+                         (unless (-key-match-p '(or \\Noselect \\NonExistent)
+                                               (alist-get 'flags props))
+                           (list `[,name (funcall ,callback ,action ,name)])))
+                       (-get-mailbox-listing (car mailbox))))))
+      (easy-menu-add-item
+       menu nil (if (length= set 1) "Message" (format "%s Messages" (length set))))
+      (easy-menu-add-item
+       menu nil `("Flags" :filter ,flagitems
+                  \\Seen \\Flagged \\Answered $Forwarded $Junk))
+      (easy-menu-add-item
+       menu nil `("Copy To" :filter ,mbitems 'copy))
+      (easy-menu-add-item
+       menu nil `("Move To" :filter ,mbitems 'move))))
+  menu)
 
 (define-derived-mode minimail-mailbox-mode special-mode "Mailbox"
   "Major mode for mailbox listings."
@@ -1939,6 +2013,7 @@ current message."
   (add-hook '-vtable-before-sort-by-current-column-hook
             (lambda () (setq -sort-by-thread nil))
             nil t)
+  (add-hook 'context-menu-functions '-message-context-menu nil t)
   (setq-local
    buffer-undo-list t
    revert-buffer-function #'-mailbox-buffer-refresh
@@ -2111,6 +2186,11 @@ current message."
                    (propertize (file-size-human-readable-iec v)
                                'face 'vtable)))))
 
+(defun -mailbox-total-messages ()
+  ;; FIXME: Wrong for search mailboxes
+  (seq-reduce (lambda (i msg) (max i (-message-id msg)))
+              -message-list 0))
+
 (defun -mailbox-buffer-update (messages)
   "Set `minimail--message-list' to MESSAGES and do all necessary adjustments."
   (-vtable-ensure-table)
@@ -2133,15 +2213,14 @@ current message."
           (setq overlay-arrow-position nil))))
     (-vtable-find-object (lambda (m) (eq (-message-uid m) point-uid))))
   (save-excursion
-    (let* ((inhibit-read-only t)
-           (count (length messages))
-           (idmax (seq-reduce (lambda (i msg) (max i (-message-id msg)))
-                              messages 0)))
+    (let ((inhibit-read-only t)
+          (count (length -message-list))
+          (total (-mailbox-total-messages)))
       (vtable-end-of-table)
       (delete-region (point) (point-max))
-      (insert (if (eq count idmax)
+      (insert (if (eq count total)
                   "Showing all messages\n"
-                (format "Showing %s of %s messages %s\n" count idmax
+                (format "Showing %s of %s messages %s\n" count total
                         (buttonize "[load more]"
                                    (lambda (_)
                                      (minimail-load-more-messages)))))))))
@@ -2279,6 +2358,8 @@ flag if at least one message is missing it, and remove it otherwise.
 Interactively, SET is given by the selected messages or the message
 under point, FLAGS is read from the minibuffer and HOW comes from the
 prefix argument."
+  ;; FIXME: It doesn't make sense to have a public function with a SET
+  ;; argument, as there is not public API to obtain such a list.
   (interactive (let* ((how (prefix-numeric-value (or current-prefix-arg 0)))
                       ;; TODO: use flags from EXAMINE
                       (flags (mapcar #'-flag-readable-name
@@ -2435,14 +2516,19 @@ style.  If DESCEND is non-nil, use the opposite convention."
     (cl-letf (((vtable-sort-by table) nil))
       (vtable-revert-command))))
 
-(defun minimail-toggle-sort-by-thread ()
-  "Toggle sorting messages by thread."
-  (interactive nil minimail-mailbox-mode)
-  (setq -sort-by-thread (cadr (memq -sort-by-thread '(nil ascend descend))))
-  (message "Sorting by thread: %s" (or -sort-by-thread "disabled"))
-  ;; First re-sort the table by the original criteria, either
-  ;; because that's the final goal (new is nil) or in preparation
-  ;; for the thread sorting step.
+(defun minimail-sort-by-thread (arg)
+  "Toggle sorting messages by thread.
+ARG can be one specific thread sorting style (nil, ascend or descend),
+or t to toggle between those options."
+  (interactive '(t) minimail-mailbox-mode)
+  (setq -sort-by-thread
+        (pcase-exhaustive arg
+          ((or 'nil 'ascend 'descend) arg)
+          ('t (cadr (memq -sort-by-thread '(nil ascend descend))))))
+  (message "Sorting by thread: %s" (or -sort-by-thread 'off))
+  ;; First re-sort the table by the original criteria, either because
+  ;; that's the final goal or in preparation for the thread sorting
+  ;; step.
   (vtable-revert-command)
   (when -sort-by-thread
     (-sort-by-thread (eq -sort-by-thread 'descend))))
@@ -2455,6 +2541,18 @@ style.  If DESCEND is non-nil, use the opposite convention."
 (defvar-keymap minimail-message-mode-map
   :parent (make-composed-keymap (list minimail-base-keymap button-buffer-map)
                                 special-mode-map))
+
+(easy-menu-define nil minimail-message-mode-map
+  "Menu for `minimail-message-mode'."
+  ;; TODO: Add the content of the context menu for messages here.
+  '("Message"
+    ["Reply" minimail-reply]
+    ["Reply All" minimail-reply-all]
+    ["Forward" minimail-forward]
+    ["Search Messages" minimail-search
+     :help "Search for messages in this mailbox"]
+    ["Compose New Message" compose-mail
+     :help "Start writing a new mail message"]))
 
 (define-derived-mode minimail-message-mode special-mode "Message"
   "Major mode for email messages."
@@ -2689,8 +2787,8 @@ the user selected another message in the meanwhile, yield nil."
 (defvar-keymap minimail-overview-mode-map
   :parent (make-composed-keymap widget-keymap special-mode-map)
   ":" #'minimail-execute-server-command
-  "m" #'compose-mail
-  "s" #'minimail-search)
+  "s" #'minimail-search
+  "c" #'compose-mail)
 
 (define-derived-mode minimail-overview-mode special-mode "Minimail"
   "Major mode for browsing a mailbox tree."
