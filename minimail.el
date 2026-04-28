@@ -6,7 +6,7 @@
 ;; Keywords: mail
 ;; URL: https://codeberg.org/astoff/minimail
 ;; Package-Requires: ((emacs "30.1") (transient "0.12"))
-;; Version: 0.4
+;; Version: 0.4.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
