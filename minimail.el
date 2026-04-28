@@ -793,10 +793,13 @@ In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" oth
          (user (cond ((url-user url) (url-unhex-string (url-user url)))
                      ((plist-get props :mail-address))))
          (pass (or (url-password url)
-                   (auth-source-pick-first-password
-                    :user user
-                    :host (url-host url)
-                    :port (url-portspec url))
+                   (let ((enable-recursive-minibuffers t))
+                     (auth-source-pick-first-password
+                      :user user
+                      :host (url-host url)
+                      :port (url-portspec url)
+                      ;; TODO: Offer to save, if authentication successful.
+                      :create t))
                    (error "No password found for account %s" account)))
          (buffer (generate-new-buffer (format " *minimail-%s*" account)))
          (proc (open-network-stream
